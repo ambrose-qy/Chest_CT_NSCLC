@@ -1,0 +1,40 @@
+# Ignore dataset files
+data/raw/*
+data/processed/*
+
+# Keep folder structure
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Ignore model outputs
+outputs/
+models/
+checkpoints/
+runs/
+
+# Ignore common large ML files
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+*.zip
+*.tar
+*.tar.gz
+*.7z
+*.rar
+
+# Ignore image / medical image files
+*.dcm
+*.nii
+*.nii.gz
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+
+# Python cache
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
