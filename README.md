@@ -34,6 +34,8 @@ Chest_CT_NSCLC/
 |   |-- LIDC_process2.py
 |   |-- LIDC_process3.py
 |   |-- LIDC_process4.py
+|   |-- LIDC_process5.py
+|   |-- LIDC_process6.py
 |   |-- LUNA_process.py
 |   |-- LUNA_process2.py
 |   `-- LUNA16_data_analysis.ipynb
@@ -49,6 +51,8 @@ Chest_CT_NSCLC/
 - `data_analysis/LIDC_process2.py` clusters multi-reader XML annotations and scores annotation consistency.
 - `data_analysis/LIDC_process3.py` extracts agreed nodule ROI manifests for nodules >=3 mm approved by at least 3 radiologists.
 - `data_analysis/LIDC_process4.py` constructs malignancy labels and patient-level train/validation/test splits using 70/10/20 proportions with risk-label balancing.
+- `data_analysis/LIDC_process5.py` exports standardised 3D nodule ROI volume files, label manifests, preprocessing QC, and outlier-handling reports.
+- `data_analysis/LIDC_process6.py` writes missing-data, outlier, and conservative imputation-planning tables for report/model use.
 - `data_analysis/LUNA_process.py` preprocesses LUNA16 subset0-4 from `E:\LUNA`, including de-identification, 1 mm resampling, HU normalisation, lung parenchyma segmentation, and coordinate validation.
 - `data_analysis/LUNA_process2.py` preprocesses LUNA16 subset5-9 from `D:\LUNA` with the same pipeline and project-local output naming.
 - `data_analysis/LIDC_analysis.ipynb` and `data_analysis/LUNA16_data_analysis.ipynb` are notebook references used during workflow development.
@@ -114,9 +118,12 @@ conda run -n torch-gpu python data_analysis\LIDC_process1.py
 conda run -n torch-gpu python data_analysis\LIDC_process2.py --force
 conda run -n torch-gpu python data_analysis\LIDC_process3.py
 conda run -n torch-gpu python data_analysis\LIDC_process4.py
+conda run -n torch-gpu python data_analysis\LIDC_process5.py
+conda run -n torch-gpu python data_analysis\LIDC_process6.py
 ```
 
 `LIDC_process4.py` defaults to train/validation/test proportions of 70/10/20 and balances benign/malignant and low/intermediate/high-risk labels across splits while keeping patients separated.
+`LIDC_process5.py` writes fixed-shape 3D ROI volumes as compressed `.npz` files under `data/processed/lidc_roi_3d/volumes/`; use `--max-rois 20 --force` for a small validation run before full extraction.
 
 ## LIDC Outputs
 
@@ -137,6 +144,17 @@ Main table outputs in the current run include:
 - `lidc_roi_multiclass_split_manifest.csv`: low/intermediate/high-risk split manifest.
 - `lidc_split_label_balance_diagnostics.csv`: train/validation/test label balance diagnostics.
 - `lidc_processed_quality_control_report.csv`: downstream analysis risk checks.
+- `lidc_roi_3d_volume_manifest.csv`: standardised 3D ROI volume file manifest.
+- `lidc_roi_3d_label_manifest.csv`: volume-level binary and multiclass label file.
+- `lidc_roi_3d_preprocessing_qc.csv`: before/after preprocessing statistics for each exported ROI volume.
+- `lidc_roi_3d_outlier_report.csv`: outliers, failures, and applied handling during 3D ROI preprocessing.
+- `lidc_roi_3d_preprocessing_summary.csv`: dataset-level summary for the standardised 3D ROI export.
+- `data/processed/lidc_roi_3d/volumes/*.npz`: compressed standardised 3D ROI volumes with array key `volume`.
+- `lidc_data_quality_issue_summary.csv`: missing-data and outlier issue summary with recommended handling.
+- `lidc_demographics_imputation_plan.csv`: age/sex handling plan for reports and model covariates.
+- `lidc_patient_demographics_model_ready.csv`: patient demographics with age imputation fields, sex Unknown category, and missingness flags.
+- `lidc_annotation_outlier_rows.csv`: raw XML annotation rows with spacing, diameter, and score issues.
+- `lidc_roi_quality_issue_rows.csv`: ROI-level missing-label, low-consistency, and discordant-label issue rows.
 
 Main figure outputs include:
 
@@ -155,6 +173,12 @@ Current generated QC highlights:
 - The current ROI extraction manifest contains 1,593 eligible lesion ROIs.
 - The current malignancy labels contain 338 low-risk, 768 intermediate-risk, 284 high-risk, and 203 missing-score ROIs.
 - Five annotations have estimated maximum diameter greater than 60 mm and should be reviewed before modeling.
+
+## LIDC Report Checklist Artifacts
+
+- Data exploration and analysis report: use `lidc_patient_*`, `lidc_nodule_*`, `lidc_annotation_consistency_*`, `lidc_multireader_consistency_summary.csv`, and the LIDC figures under `data/processed/figures/`.
+- Standardised lung nodule ROI dataset: use `data/processed/lidc_roi_3d/volumes/*.npz`, `lidc_roi_3d_volume_manifest.csv`, and `lidc_roi_3d_label_manifest.csv`.
+- Data quality assessment report: use `lidc_processed_quality_control_report.csv`, `lidc_data_quality_issue_summary.csv`, `lidc_demographics_imputation_plan.csv`, `lidc_annotation_outlier_rows.csv`, `lidc_roi_quality_issue_rows.csv`, `lidc_roi_3d_preprocessing_qc.csv`, `lidc_roi_3d_outlier_report.csv`, and `lidc_roi_3d_preprocessing_summary.csv`.
 
 ## LUNA16 Workflow
 
