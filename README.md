@@ -36,6 +36,15 @@ Chest_CT_NSCLC/
 |   |-- LIDC_process4.py
 |   |-- LIDC_process5.py
 |   |-- LIDC_process6.py
+|   |-- LIDC_train_2d_lightning.py
+|   |-- LIDC_train_3d_lightning.py
+|   |-- LIDC_2d_resnet.py
+|   |-- LIDC_2d_densenet.py
+|   |-- LIDC_3d_resnet.py
+|   |-- LIDC_3d_vnet.py
+|   |-- LIDC_evaluate_lightning.py
+|   |-- LIDC_tune_lightning.py
+|   |-- LIDC_compare_lightning_experiments.py
 |   |-- LUNA_process.py
 |   |-- LUNA_process2.py
 |   `-- LUNA16_data_analysis.ipynb
@@ -53,6 +62,12 @@ Chest_CT_NSCLC/
 - `data_analysis/LIDC_process4.py` constructs malignancy labels and patient-level train/validation/test splits using 70/10/20 proportions with risk-label balancing.
 - `data_analysis/LIDC_process5.py` exports standardised 3D nodule ROI volume files, label manifests, preprocessing QC, and outlier-handling reports.
 - `data_analysis/LIDC_process6.py` writes missing-data, outlier, and conservative imputation-planning tables for report/model use.
+- `data_analysis/LIDC_train_2d_lightning.py` trains Lightning 2D ResNet/DenseNet baselines on maximum cross-sectional nodule slices.
+- `data_analysis/LIDC_train_3d_lightning.py` trains Lightning 3D ResNet/VNet baselines on standardised 3D ROI volumes.
+- `data_analysis/LIDC_2d_resnet.py`, `LIDC_2d_densenet.py`, `LIDC_3d_resnet.py`, and `LIDC_3d_vnet.py` are model-named training entry points that share the same preprocessing, augmentation, logging, early stopping, scheduling, and evaluation code.
+- `data_analysis/LIDC_evaluate_lightning.py` evaluates a Lightning checkpoint on the independent test set and writes metrics, predictions, confusion matrix, and ROC data.
+- `data_analysis/LIDC_tune_lightning.py` writes or executes hyperparameter tuning plans and records the best configuration.
+- `data_analysis/LIDC_compare_lightning_experiments.py` aggregates completed Lightning runs into a model-comparison report.
 - `data_analysis/LUNA_process.py` preprocesses LUNA16 subset0-4 from `E:\LUNA`, including de-identification, 1 mm resampling, HU normalisation, lung parenchyma segmentation, and coordinate validation.
 - `data_analysis/LUNA_process2.py` preprocesses LUNA16 subset5-9 from `D:\LUNA` with the same pipeline and project-local output naming.
 - `data_analysis/LIDC_analysis.ipynb` and `data_analysis/LUNA16_data_analysis.ipynb` are notebook references used during workflow development.
@@ -179,6 +194,56 @@ Current generated QC highlights:
 - Data exploration and analysis report: use `lidc_patient_*`, `lidc_nodule_*`, `lidc_annotation_consistency_*`, `lidc_multireader_consistency_summary.csv`, and the LIDC figures under `data/processed/figures/`.
 - Standardised lung nodule ROI dataset: use `data/processed/lidc_roi_3d/volumes/*.npz`, `lidc_roi_3d_volume_manifest.csv`, and `lidc_roi_3d_label_manifest.csv`.
 - Data quality assessment report: use `lidc_processed_quality_control_report.csv`, `lidc_data_quality_issue_summary.csv`, `lidc_demographics_imputation_plan.csv`, `lidc_annotation_outlier_rows.csv`, `lidc_roi_quality_issue_rows.csv`, `lidc_roi_3d_preprocessing_qc.csv`, `lidc_roi_3d_outlier_report.csv`, and `lidc_roi_3d_preprocessing_summary.csv`.
+
+## LIDC Lightning Model Workflow
+
+Install Lightning in the training environment if needed:
+
+```powershell
+conda run -n torch-gpu pip install lightning
+```
+
+Build the full 2D maximum-slice manifest once:
+
+```powershell
+conda run -n torch-gpu python data_analysis\lidc_2d_slices.py --output data\processed\tables\lidc_roi_binary_2d_slice_manifest.csv
+```
+
+Train 2D baselines:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_2d_resnet.py --epochs 50 --batch-size 16
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_2d_densenet.py --epochs 50 --batch-size 16
+```
+
+Train 3D baselines:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_3d_resnet.py --epochs 60 --batch-size 4
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_3d_vnet.py --epochs 60 --batch-size 4
+```
+
+For ordinary tuning, edit the `HYPERPARAMETERS` dictionary near the top of each model-named file and run the file directly without command-line overrides. The training functions can also be imported from another script, for example `from LIDC_3d_resnet import train_3d_resnet`.
+
+Each run writes checkpoints, `config.json`, `hparams.json`, `best_config.json`, `test_metrics.json`, and Lightning CSV logs under `data/processed/model_results/lidc_lightning/<2d-or-3d>/<model-family>/<run-name>/`. The CSV logs include learning rate, loss, accuracy/F1/AUC, label counts, average absolute gradient, gradient L2 norm, maximum absolute gradient, and parameter L2 norm.
+
+On Windows, if `conda run` fails while printing Lightning progress output because of console encoding, run the environment Python directly instead:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_3d_resnet.py
+```
+
+Evaluate a saved checkpoint:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_evaluate_lightning.py --checkpoint <best.ckpt> --config <run_dir>\config.json
+```
+
+Aggregate completed runs:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_compare_lightning_experiments.py
+```
 
 ## LUNA16 Workflow
 
