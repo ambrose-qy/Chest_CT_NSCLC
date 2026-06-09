@@ -85,7 +85,77 @@ def center_crop_or_pad_3d(tensor, shape):
     return out
 
 
-def augment_2d(tensor, rotate=True, flip=True, scale=True, noise_std=0.02):
+def as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "y", "on")
+
+
+def parse_number_list(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return [float(value)]
+    if isinstance(value, (list, tuple)):
+        return [float(item) for item in value]
+    return [float(item.strip()) for item in str(value).split(",") if item.strip()]
+
+
+def normalise_tensor(tensor, mean=None, std=None):
+    if mean is None or std is None:
+        return tensor
+    mean_values = parse_number_list(mean)
+    std_values = parse_number_list(std)
+    if not mean_values or not std_values:
+        return tensor
+    if len(mean_values) == 1:
+        mean_values = mean_values * tensor.shape[0]
+    if len(std_values) == 1:
+        std_values = std_values * tensor.shape[0]
+    shape = [tensor.shape[0]] + [1] * (tensor.dim() - 1)
+    mean_tensor = torch.tensor(mean_values[:tensor.shape[0]], dtype=tensor.dtype, device=tensor.device).view(*shape)
+    std_tensor = torch.tensor(std_values[:tensor.shape[0]], dtype=tensor.dtype, device=tensor.device).view(*shape)
+    return (tensor - mean_tensor) / torch.clamp(std_tensor, min=1e-6)
+
+
+def random_cutout_2d(tensor, fraction):
+    if not fraction or fraction <= 0:
+        return tensor
+    _, height, width = tensor.shape
+    cut_h = max(1, int(round(height * fraction)))
+    cut_w = max(1, int(round(width * fraction)))
+    y0 = random.randint(0, max(height - cut_h, 0))
+    x0 = random.randint(0, max(width - cut_w, 0))
+    fill = float(tensor.mean())
+    tensor[:, y0:y0 + cut_h, x0:x0 + cut_w] = fill
+    return tensor
+
+
+def random_cutout_3d(tensor, fraction):
+    if not fraction or fraction <= 0:
+        return tensor
+    _, depth, height, width = tensor.shape
+    cut_d = max(1, int(round(depth * fraction)))
+    cut_h = max(1, int(round(height * fraction)))
+    cut_w = max(1, int(round(width * fraction)))
+    z0 = random.randint(0, max(depth - cut_d, 0))
+    y0 = random.randint(0, max(height - cut_h, 0))
+    x0 = random.randint(0, max(width - cut_w, 0))
+    fill = float(tensor.mean())
+    tensor[:, z0:z0 + cut_d, y0:y0 + cut_h, x0:x0 + cut_w] = fill
+    return tensor
+
+
+def augment_2d(
+    tensor,
+    rotate=True,
+    flip=True,
+    scale=True,
+    noise_std=0.02,
+    intensity_shift=0.05,
+    contrast_range=0.10,
+    cutout_fraction=0.0,
+):
     if flip and random.random() < 0.5:
         tensor = torch.flip(tensor, dims=(2,))
     if flip and random.random() < 0.5:
@@ -98,13 +168,30 @@ def augment_2d(tensor, rotate=True, flip=True, scale=True, noise_std=0.02):
         scaled = [max(4, int(round(value * factor))) for value in original]
         tensor = F.interpolate(tensor.unsqueeze(0), size=scaled, mode="bilinear", align_corners=False).squeeze(0)
         tensor = center_crop_or_pad_2d(tensor, original)
+    if contrast_range and contrast_range > 0:
+        factor = random.uniform(1.0 - contrast_range, 1.0 + contrast_range)
+        tensor = (tensor - tensor.mean()) * factor + tensor.mean()
+    if intensity_shift and intensity_shift > 0:
+        tensor = tensor + random.uniform(-intensity_shift, intensity_shift)
     if noise_std and noise_std > 0:
         tensor = tensor + torch.randn_like(tensor) * float(noise_std)
         tensor = torch.clamp(tensor, 0.0, 1.0)
+    if cutout_fraction and cutout_fraction > 0 and random.random() < 0.5:
+        tensor = random_cutout_2d(tensor, cutout_fraction)
+    tensor = torch.clamp(tensor, 0.0, 1.0)
     return tensor
 
 
-def augment_3d(tensor, rotate=True, flip=True, scale=True, noise_std=0.02):
+def augment_3d(
+    tensor,
+    rotate=True,
+    flip=True,
+    scale=True,
+    noise_std=0.02,
+    intensity_shift=0.05,
+    contrast_range=0.10,
+    cutout_fraction=0.0,
+):
     if flip and random.random() < 0.5:
         tensor = torch.flip(tensor, dims=(3,))
     if flip and random.random() < 0.5:
@@ -119,9 +206,17 @@ def augment_3d(tensor, rotate=True, flip=True, scale=True, noise_std=0.02):
         scaled = [max(4, int(round(value * factor))) for value in original]
         tensor = F.interpolate(tensor.unsqueeze(0), size=scaled, mode="trilinear", align_corners=False).squeeze(0)
         tensor = center_crop_or_pad_3d(tensor, original)
+    if contrast_range and contrast_range > 0:
+        factor = random.uniform(1.0 - contrast_range, 1.0 + contrast_range)
+        tensor = (tensor - tensor.mean()) * factor + tensor.mean()
+    if intensity_shift and intensity_shift > 0:
+        tensor = tensor + random.uniform(-intensity_shift, intensity_shift)
     if noise_std and noise_std > 0:
         tensor = tensor + torch.randn_like(tensor) * float(noise_std)
         tensor = torch.clamp(tensor, 0.0, 1.0)
+    if cutout_fraction and cutout_fraction > 0 and random.random() < 0.5:
+        tensor = random_cutout_3d(tensor, cutout_fraction)
+    tensor = torch.clamp(tensor, 0.0, 1.0)
     return tensor
 
 
@@ -135,6 +230,15 @@ class LIDC2DMaxSliceDataset(Dataset):
         augment=False,
         max_samples=None,
         in_channels=3,
+        normalization_mean=None,
+        normalization_std=None,
+        augment_rotate=True,
+        augment_flip=True,
+        augment_scale=True,
+        augment_noise_std=0.02,
+        augment_intensity_shift=0.05,
+        augment_contrast_range=0.10,
+        augment_cutout_fraction=0.0,
     ):
         self.manifest_path = Path(manifest_path)
         self.split = split
@@ -142,6 +246,15 @@ class LIDC2DMaxSliceDataset(Dataset):
         self.image_size = int(image_size)
         self.augment = bool(augment)
         self.in_channels = int(in_channels)
+        self.normalization_mean = normalization_mean
+        self.normalization_std = normalization_std
+        self.augment_rotate = augment_rotate
+        self.augment_flip = augment_flip
+        self.augment_scale = augment_scale
+        self.augment_noise_std = augment_noise_std
+        self.augment_intensity_shift = augment_intensity_shift
+        self.augment_contrast_range = augment_contrast_range
+        self.augment_cutout_fraction = augment_cutout_fraction
         rows = read_csv_rows(self.manifest_path)
 
         if task != "binary":
@@ -171,10 +284,20 @@ class LIDC2DMaxSliceDataset(Dataset):
             mode="bilinear",
             align_corners=False,
         ).squeeze(0)
-        if self.augment:
-            tensor = augment_2d(tensor)
         if self.in_channels > 1:
             tensor = tensor.repeat(self.in_channels, 1, 1)
+        if self.augment:
+            tensor = augment_2d(
+                tensor,
+                rotate=as_bool(self.augment_rotate),
+                flip=as_bool(self.augment_flip),
+                scale=as_bool(self.augment_scale),
+                noise_std=float(self.augment_noise_std),
+                intensity_shift=float(self.augment_intensity_shift),
+                contrast_range=float(self.augment_contrast_range),
+                cutout_fraction=float(self.augment_cutout_fraction),
+            )
+        tensor = normalise_tensor(tensor, self.normalization_mean, self.normalization_std)
         label = safe_int(row.get("binary_label_id"))
         return {
             "image": tensor,
@@ -192,11 +315,29 @@ class LIDC3DVolumeDataset(Dataset):
         task="binary",
         augment=False,
         max_samples=None,
+        normalization_mean=None,
+        normalization_std=None,
+        augment_rotate=True,
+        augment_flip=True,
+        augment_scale=True,
+        augment_noise_std=0.02,
+        augment_intensity_shift=0.05,
+        augment_contrast_range=0.10,
+        augment_cutout_fraction=0.0,
     ):
         self.manifest_path = Path(manifest_path)
         self.split = split
         self.task = task
         self.augment = bool(augment)
+        self.normalization_mean = normalization_mean
+        self.normalization_std = normalization_std
+        self.augment_rotate = augment_rotate
+        self.augment_flip = augment_flip
+        self.augment_scale = augment_scale
+        self.augment_noise_std = augment_noise_std
+        self.augment_intensity_shift = augment_intensity_shift
+        self.augment_contrast_range = augment_contrast_range
+        self.augment_cutout_fraction = augment_cutout_fraction
         rows = read_csv_rows(self.manifest_path)
         if task == "binary":
             rows = [
@@ -227,7 +368,17 @@ class LIDC3DVolumeDataset(Dataset):
             volume = npz["volume"].astype(np.float32)
         tensor = torch.from_numpy(volume).float().unsqueeze(0)
         if self.augment:
-            tensor = augment_3d(tensor)
+            tensor = augment_3d(
+                tensor,
+                rotate=as_bool(self.augment_rotate),
+                flip=as_bool(self.augment_flip),
+                scale=as_bool(self.augment_scale),
+                noise_std=float(self.augment_noise_std),
+                intensity_shift=float(self.augment_intensity_shift),
+                contrast_range=float(self.augment_contrast_range),
+                cutout_fraction=float(self.augment_cutout_fraction),
+            )
+        tensor = normalise_tensor(tensor, self.normalization_mean, self.normalization_std)
         label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
         label = safe_int(row.get(label_col))
         return {
@@ -249,6 +400,16 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         num_workers=0,
         max_samples_per_split=None,
         in_channels=3,
+        normalization_mean=None,
+        normalization_std=None,
+        normalization_stats_samples=128,
+        augment_rotate=True,
+        augment_flip=True,
+        augment_scale=True,
+        augment_noise_std=0.02,
+        augment_intensity_shift=0.05,
+        augment_contrast_range=0.10,
+        augment_cutout_fraction=0.0,
     ):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -259,6 +420,17 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         self.num_workers = int(num_workers)
         self.max_samples_per_split = max_samples_per_split
         self.in_channels = int(in_channels)
+        self.normalization_mean = normalization_mean
+        self.normalization_std = normalization_std
+        self.normalization_stats_samples = normalization_stats_samples
+        self.augment_rotate = augment_rotate
+        self.augment_flip = augment_flip
+        self.augment_scale = augment_scale
+        self.augment_noise_std = augment_noise_std
+        self.augment_intensity_shift = augment_intensity_shift
+        self.augment_contrast_range = augment_contrast_range
+        self.augment_cutout_fraction = augment_cutout_fraction
+        self.normalization_stats = {}
 
     def setup(self, stage=None):
         if self.input_dim == "2d":
@@ -276,14 +448,28 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             task=self.task,
             augment=True,
             max_samples=self.max_samples_per_split,
+            normalization_mean=None,
+            normalization_std=None,
+            augment_rotate=self.augment_rotate,
+            augment_flip=self.augment_flip,
+            augment_scale=self.augment_scale,
+            augment_noise_std=self.augment_noise_std,
+            augment_intensity_shift=self.augment_intensity_shift,
+            augment_contrast_range=self.augment_contrast_range,
+            augment_cutout_fraction=self.augment_cutout_fraction,
             **kwargs
         )
+        mean, std = self.resolve_normalization_stats(dataset_cls, kwargs)
+        self.train_dataset.normalization_mean = mean
+        self.train_dataset.normalization_std = std
         self.val_dataset = dataset_cls(
             self.manifest_path,
             split="val",
             task=self.task,
             augment=False,
             max_samples=self.max_samples_per_split,
+            normalization_mean=mean,
+            normalization_std=std,
             **kwargs
         )
         self.test_dataset = dataset_cls(
@@ -292,8 +478,37 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             task=self.task,
             augment=False,
             max_samples=self.max_samples_per_split,
+            normalization_mean=mean,
+            normalization_std=std,
             **kwargs
         )
+
+    def resolve_normalization_stats(self, dataset_cls, kwargs):
+        if self.normalization_mean not in (None, "", "auto") and self.normalization_std not in (None, "", "auto"):
+            self.normalization_stats = {
+                "mean": self.normalization_mean,
+                "std": self.normalization_std,
+                "source": "hyperparameters",
+            }
+            return self.normalization_mean, self.normalization_std
+        stats_dataset = dataset_cls(
+            self.manifest_path,
+            split="train",
+            task=self.task,
+            augment=False,
+            max_samples=self.normalization_stats_samples,
+            normalization_mean=None,
+            normalization_std=None,
+            **kwargs
+        )
+        mean, std, count = compute_dataset_mean_std(stats_dataset)
+        self.normalization_stats = {
+            "mean": mean,
+            "std": std,
+            "source": "train_split_sample",
+            "sample_count": count,
+        }
+        return mean, std
 
     def train_dataloader(self):
         return DataLoader(
@@ -329,3 +544,19 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             "test": dict(self.test_dataset.label_counts()),
         }
 
+
+def compute_dataset_mean_std(dataset):
+    total_sum = 0.0
+    total_sq_sum = 0.0
+    total_count = 0
+    for index in range(len(dataset)):
+        item = dataset[index]
+        tensor = item["image"].float()
+        total_sum += float(tensor.sum())
+        total_sq_sum += float((tensor * tensor).sum())
+        total_count += tensor.numel()
+    if total_count == 0:
+        return 0.5, 0.25, 0
+    mean = total_sum / float(total_count)
+    variance = max(total_sq_sum / float(total_count) - mean * mean, 1e-8)
+    return mean, variance ** 0.5, len(dataset)

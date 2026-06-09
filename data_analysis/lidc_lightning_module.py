@@ -30,6 +30,8 @@ class LIDCClassifier(pl.LightningModule):
         in_channels=None,
         scheduler="cosine",
         max_epochs=50,
+        dropout=0.2,
+        gradient_clip_val=0.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -39,12 +41,14 @@ class LIDCClassifier(pl.LightningModule):
             num_classes=num_classes,
             pretrained=pretrained,
             in_channels=in_channels,
+            dropout=dropout,
         )
         if class_weights is not None:
             class_weights = torch.tensor(class_weights, dtype=torch.float32)
         self.register_buffer("class_weights", class_weights if class_weights is not None else torch.empty(0))
         self.criterion = nn.CrossEntropyLoss(weight=self.class_weights if self.class_weights.numel() else None)
         self._epoch_outputs = {"train": [], "val": [], "test": []}
+        self._logged_static_hparams = False
 
     def forward(self, x):
         return self.model(x)
@@ -85,6 +89,12 @@ class LIDCClassifier(pl.LightningModule):
 
     def on_train_epoch_start(self):
         self._epoch_outputs["train"] = []
+        if not self._logged_static_hparams:
+            self.log("hparam_dropout", float(self.hparams.dropout), on_epoch=True, prog_bar=False)
+            self.log("hparam_gradient_clip_val", float(self.hparams.gradient_clip_val), on_epoch=True, prog_bar=False)
+            self.log("hparam_learning_rate", float(self.hparams.lr), on_epoch=True, prog_bar=False)
+            self.log("hparam_weight_decay", float(self.hparams.weight_decay), on_epoch=True, prog_bar=False)
+            self._logged_static_hparams = True
 
     def on_validation_epoch_start(self):
         self._epoch_outputs["val"] = []
@@ -131,6 +141,14 @@ class LIDCClassifier(pl.LightningModule):
 
     def on_test_epoch_end(self):
         self._epoch_end("test")
+
+    def collect_epoch_outputs(self, stage="test"):
+        outputs = self._epoch_outputs.get(stage, [])
+        if not outputs:
+            return [], []
+        labels = torch.cat([item["labels"] for item in outputs]).numpy()
+        probabilities = torch.cat([item["probabilities"] for item in outputs]).numpy()
+        return labels, probabilities
 
     def on_before_optimizer_step(self, optimizer):
         grad_abs_sum = 0.0

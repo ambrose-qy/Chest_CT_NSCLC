@@ -117,25 +117,32 @@ class VNetClassifier(nn.Module):
         return self.classifier(x)
 
 
-def create_lidc_lightning_model(model_name, input_dim, num_classes=2, pretrained=False, in_channels=None):
+def create_lidc_lightning_model(model_name, input_dim, num_classes=2, pretrained=False, in_channels=None, dropout=0.2):
     model_name = model_name.lower()
     if input_dim == "2d":
-        return create_lidc_model(
+        model = create_lidc_model(
             model_name=model_name,
             num_classes=num_classes,
             pretrained=pretrained,
             in_channels=3 if in_channels is None else in_channels,
         )
+        if model_name.startswith("resnet") and hasattr(model, "fc"):
+            in_features = model.fc.in_features if hasattr(model.fc, "in_features") else model.fc[-1].in_features
+            model.fc = nn.Sequential(nn.Dropout(float(dropout)), nn.Linear(in_features, num_classes))
+        elif model_name.startswith("densenet") and hasattr(model, "classifier"):
+            in_features = model.classifier.in_features if hasattr(model.classifier, "in_features") else model.classifier[-1].in_features
+            model.classifier = nn.Sequential(nn.Dropout(float(dropout)), nn.Linear(in_features, num_classes))
+        return model
 
     if input_dim != "3d":
         raise ValueError("input_dim must be 2d or 3d.")
 
     if model_name in ("resnet3d", "resnet3d18"):
-        return ResNet3D(layers=(2, 2, 2), channels=(32, 64, 128), in_channels=1, num_classes=num_classes)
+        return ResNet3D(layers=(2, 2, 2), channels=(32, 64, 128), in_channels=1, num_classes=num_classes, dropout=dropout)
     if model_name in ("resnet3d34",):
-        return ResNet3D(layers=(3, 4, 6), channels=(32, 64, 128), in_channels=1, num_classes=num_classes)
+        return ResNet3D(layers=(3, 4, 6), channels=(32, 64, 128), in_channels=1, num_classes=num_classes, dropout=dropout)
     if model_name in ("vnet", "vnet3d"):
-        return VNetClassifier(in_channels=1, num_classes=num_classes)
+        return VNetClassifier(in_channels=1, num_classes=num_classes, dropout=dropout)
 
     raise ValueError(
         "Unsupported model '{}'. Use 2D resnet18/resnet34/resnet50/densenet121/densenet169 "
@@ -145,4 +152,3 @@ def create_lidc_lightning_model(model_name, input_dim, num_classes=2, pretrained
 
 def count_parameters(model):
     return sum(parameter.numel() for parameter in model.parameters() if parameter.requires_grad)
-

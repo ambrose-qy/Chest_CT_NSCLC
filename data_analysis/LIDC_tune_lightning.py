@@ -10,10 +10,12 @@ from __future__ import print_function
 import argparse
 import itertools
 import json
-import subprocess
-import sys
 from pathlib import Path
 
+from LIDC_2d_densenet import train_2d_densenet
+from LIDC_2d_resnet import train_2d_resnet
+from LIDC_3d_resnet import train_3d_resnet
+from LIDC_3d_vnet import train_3d_vnet
 from lidc_lightning_utils import EXPERIMENT_DIR, write_csv, write_json
 
 
@@ -55,27 +57,37 @@ def expand_grid(grid):
         yield dict(zip(keys, values))
 
 
-def build_command(args, config, run_output_dir):
-    script = "LIDC_train_2d_lightning.py" if args.input_dim == "2d" else "LIDC_train_3d_lightning.py"
-    command = [
-        sys.executable,
-        str(Path(__file__).resolve().parent / script),
-        "--model", str(config["model"]),
-        "--task", args.task,
-        "--epochs", str(args.epochs),
-        "--batch-size", str(config["batch_size"]),
-        "--lr", str(config["lr"]),
-        "--weight-decay", str(config["weight_decay"]),
-        "--scheduler", str(config["scheduler"]),
-        "--early-stop-patience", str(args.early_stop_patience),
-        "--seed", str(args.seed),
-        "--output-dir", str(run_output_dir),
-        "--num-workers", str(args.num_workers),
-        "--precision", args.precision,
-    ]
+def trainer_for_model(input_dim, model_name):
+    name = str(model_name).lower()
+    if input_dim == "2d" and name.startswith("resnet"):
+        return train_2d_resnet
+    if input_dim == "2d" and name.startswith("densenet"):
+        return train_2d_densenet
+    if input_dim == "3d" and name.startswith("resnet"):
+        return train_3d_resnet
+    if input_dim == "3d" and name.startswith("vnet"):
+        return train_3d_vnet
+    raise ValueError("No trainer function for input_dim={} model={}".format(input_dim, model_name))
+
+
+def build_overrides(args, config, run_output_dir):
+    overrides = {
+        "model": config["model"],
+        "task": args.task,
+        "epochs": args.epochs,
+        "batch_size": config["batch_size"],
+        "lr": config["lr"],
+        "weight_decay": config["weight_decay"],
+        "scheduler": config["scheduler"],
+        "early_stop_patience": args.early_stop_patience,
+        "seed": args.seed,
+        "output_dir": run_output_dir,
+        "num_workers": args.num_workers,
+        "precision": args.precision,
+    }
     if args.max_samples_per_split is not None:
-        command.extend(["--max-samples-per-split", str(args.max_samples_per_split)])
-    return command
+        overrides["max_samples_per_split"] = args.max_samples_per_split
+    return overrides
 
 
 def parse_args(argv=None):
@@ -104,7 +116,7 @@ def main(argv=None):
     best = None
     for index, config in enumerate(configs, start=1):
         run_output_dir = args.output_dir / "{}_runs".format(args.input_dim)
-        command = build_command(args, config, run_output_dir)
+        overrides = build_overrides(args, config, run_output_dir)
         row = {
             "experiment_id": index,
             "input_dim": args.input_dim,
@@ -114,7 +126,8 @@ def main(argv=None):
             "weight_decay": config["weight_decay"],
             "batch_size": config["batch_size"],
             "scheduler": config["scheduler"],
-            "command": " ".join(str(part) for part in command),
+            "trainer_function": trainer_for_model(args.input_dim, config["model"]).__name__,
+            "overrides": json.dumps({key: str(value) for key, value in overrides.items()}, sort_keys=True),
             "status": "planned",
             "return_code": "",
             "best_score": "",
@@ -122,18 +135,19 @@ def main(argv=None):
         }
 
         if args.execute:
-            completed = subprocess.run(command, cwd=str(Path(__file__).resolve().parents[1]))
-            row["return_code"] = completed.returncode
-            row["status"] = "complete" if completed.returncode == 0 else "failed"
-            run_name = "{}_{}_{}_seed{}".format(args.input_dim, str(config["model"]).lower(), args.task, args.seed)
-            best_config_path = run_output_dir / run_name / "best_config.json"
-            row["best_config_path"] = str(best_config_path)
-            if best_config_path.exists():
-                with best_config_path.open("r", encoding="utf-8") as f:
-                    payload = json.load(f)
+            try:
+                trainer = trainer_for_model(args.input_dim, config["model"])
+                payload = trainer(overrides=overrides)
+                row["return_code"] = 0
+                row["status"] = "complete"
+                row["best_config_path"] = payload.get("best_config_path", payload.get("config_path", ""))
                 row["best_score"] = payload.get("best_score", "")
                 if row["best_score"] != "" and (best is None or float(row["best_score"]) > float(best["best_score"])):
                     best = row
+            except Exception as exc:
+                row["return_code"] = 1
+                row["status"] = "failed"
+                row["error"] = str(exc)
 
         plan_rows.append(row)
         write_csv(args.output_dir / "{}_tuning_records.csv".format(args.input_dim), plan_rows)

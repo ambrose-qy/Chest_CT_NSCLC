@@ -12,7 +12,8 @@ Run from the repository root:
 
     conda run -n torch-gpu python data_analysis/lidc_2d_slices.py
 
-The output is used by LIDC_train_2d_baseline.py.
+The output is used by the 2D Lightning model files such as LIDC_2d_resnet.py
+and LIDC_2d_densenet.py.
 """
 
 from __future__ import print_function
