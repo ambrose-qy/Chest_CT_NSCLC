@@ -257,11 +257,17 @@ class LIDC2DMaxSliceDataset(Dataset):
         self.augment_cutout_fraction = augment_cutout_fraction
         rows = read_csv_rows(self.manifest_path)
 
-        if task != "binary":
-            raise ValueError("2D max-slice training currently uses the binary manifest/task.")
+        if task == "binary":
+            split_col = "binary_split"
+            label_col = "binary_label_id"
+        elif task == "multiclass":
+            split_col = "multiclass_split"
+            label_col = "multiclass_risk_label_id"
+        else:
+            raise ValueError("Unsupported task '{}'. Use binary or multiclass.".format(task))
         rows = [
             row for row in rows
-            if clean_value(row.get("binary_split")) == split and clean_value(row.get("binary_label_id")) != ""
+            if clean_value(row.get(split_col)) == split and clean_value(row.get(label_col)) != ""
         ]
         if max_samples is not None:
             rows = rows[:max_samples]
@@ -271,7 +277,8 @@ class LIDC2DMaxSliceDataset(Dataset):
         return len(self.rows)
 
     def label_counts(self):
-        return Counter(safe_int(row.get("binary_label_id")) for row in self.rows)
+        label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
+        return Counter(safe_int(row.get(label_col)) for row in self.rows)
 
     def __getitem__(self, index):
         row = self.rows[index]
@@ -298,7 +305,8 @@ class LIDC2DMaxSliceDataset(Dataset):
                 cutout_fraction=float(self.augment_cutout_fraction),
             )
         tensor = normalise_tensor(tensor, self.normalization_mean, self.normalization_std)
-        label = safe_int(row.get("binary_label_id"))
+        label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
+        label = safe_int(row.get(label_col))
         return {
             "image": tensor,
             "label": torch.tensor(label, dtype=torch.long),

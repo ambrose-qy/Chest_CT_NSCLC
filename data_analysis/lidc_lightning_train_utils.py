@@ -30,6 +30,10 @@ def class_weights_from_counts(counts, num_classes):
     return weights
 
 
+def sqrt_class_weights_from_counts(counts, num_classes):
+    return [float(np.sqrt(weight)) for weight in class_weights_from_counts(counts, num_classes)]
+
+
 def parse_class_weights(value):
     if value in (None, "", "auto"):
         return None
@@ -49,6 +53,8 @@ def resolve_class_weights(args, counts, num_classes):
         if weights is None or len(weights) != num_classes:
             raise ValueError("custom_class_weights must provide {} comma-separated values.".format(num_classes))
         return weights
+    if mode == "sqrt_balanced":
+        return sqrt_class_weights_from_counts(counts, num_classes)
     return class_weights_from_counts(counts, num_classes)
 
 
@@ -137,6 +143,7 @@ def write_test_confusion_matrix(output_dir, model, task):
 
 def run_lightning_training(args, input_dim, manifest_path):
     pl = import_lightning()
+    from lidc_grad_cam import generate_grad_cam_visualizations
     from lidc_lightning_module import LIDCClassifier
     set_seed(args.seed)
 
@@ -245,6 +252,8 @@ def run_lightning_training(args, input_dim, manifest_path):
         },
         "gradient_clip_val": getattr(args, "gradient_clip_val", 0.0),
         "gradient_clip_algorithm": getattr(args, "gradient_clip_algorithm", "norm"),
+        "enable_grad_cam": bool(getattr(args, "enable_grad_cam", True)),
+        "grad_cam_max_samples": getattr(args, "grad_cam_max_samples", 12),
         "dropout": getattr(args, "dropout", 0.2),
         "parameter_count": count_parameters(model.model),
         "monitor_metric": monitor_metric,
@@ -267,6 +276,19 @@ def run_lightning_training(args, input_dim, manifest_path):
 
     best_path = callbacks[0].best_model_path
     best_score = callbacks[0].best_model_score
+    grad_cam_payload = {}
+    if bool(getattr(args, "enable_grad_cam", True)) and best_path:
+        class_names = BINARY_LABELS if args.task == "binary" else MULTICLASS_LABELS
+        cam_model = LIDCClassifier.load_from_checkpoint(str(best_path), map_location="cpu")
+        grad_cam_payload = generate_grad_cam_visualizations(
+            cam_model,
+            data_module,
+            output_dir,
+            input_dim=input_dim,
+            task=args.task,
+            class_names=class_names,
+            max_samples=getattr(args, "grad_cam_max_samples", 12),
+        )
     best_payload = {
         "run_name": run_name,
         "best_checkpoint": best_path,
@@ -274,6 +296,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         "monitor_metric": monitor_metric,
         "test_metrics": test_results[0] if test_results else {},
         "test_confusion_matrix": confusion_payload,
+        "grad_cam": grad_cam_payload,
         "config_path": str(output_dir / "config.json"),
         "best_config_path": str(output_dir / "best_config.json"),
     }
@@ -282,6 +305,8 @@ def run_lightning_training(args, input_dim, manifest_path):
     log("Best {}: {}".format(monitor_metric, best_payload["best_score"]))
     if confusion_payload:
         log("Test confusion matrix: {}".format(confusion_payload.get("confusion_matrix_csv")))
+    if grad_cam_payload:
+        log("Grad-CAM outputs: {}".format(grad_cam_payload.get("grad_cam_dir")))
     return best_payload
 
 
@@ -302,7 +327,7 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--precision", default="32-true", help="Lightning precision setting, e.g. 32-true or 16-mixed.")
     parser.add_argument("--max-samples-per-split", type=int, default=None, help="Debug limit per split.")
     parser.add_argument("--no-class-weights", action="store_true")
-    parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "custom", "none"])
+    parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "custom", "none"])
     parser.add_argument("--custom-class-weights", default=None, help="Comma-separated class weights, e.g. 1.0,1.5.")
     parser.add_argument("--normalization-mean", default="auto", help="auto or scalar/list mean for normalized HU values.")
     parser.add_argument("--normalization-std", default="auto", help="auto or scalar/list std for normalized HU values.")
@@ -317,6 +342,8 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--dropout", type=float, default=0.2)
     parser.add_argument("--gradient-clip-val", type=float, default=0.0)
     parser.add_argument("--gradient-clip-algorithm", default="norm", choices=["norm", "value"])
+    parser.add_argument("--enable-grad-cam", type=int, default=1, help="Write Grad-CAM and Grad-CAM++ visualisations after test.")
+    parser.add_argument("--grad-cam-max-samples", type=int, default=12, help="Maximum test samples visualised with Grad-CAM.")
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--log-every-n-steps", type=int, default=10)
     return parser

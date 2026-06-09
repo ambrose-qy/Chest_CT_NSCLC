@@ -10,7 +10,7 @@ from __future__ import print_function
 import argparse
 from pathlib import Path
 
-from lidc_2d_slices import DEFAULT_OUTPUT_TABLE, build_slice_manifest
+from lidc_2d_slices import DEFAULT_OUTPUT_TABLES, build_slice_manifest
 from lidc_lightning_train_utils import add_common_training_args, run_lightning_training
 from lidc_lightning_utils import EXPERIMENT_DIR, log
 
@@ -28,7 +28,7 @@ def parse_2d_args(model_name, argv=None, output_name=None, default_hparams=None)
     parser = argparse.ArgumentParser(description="Train LIDC-IDRI 2D {} Lightning baseline.".format(model_name))
     add_common_training_args(parser, default_output_dir=EXPERIMENT_DIR / "2d" / (output_name or model_name))
     parser.set_defaults(model=model_name, task="binary", batch_size=16, monitor="val_auc_roc")
-    parser.add_argument("--slice-manifest", type=Path, default=DEFAULT_OUTPUT_TABLE, help="2D max-slice manifest.")
+    parser.add_argument("--slice-manifest", type=Path, default=None, help="2D max-slice manifest.")
     parser.add_argument("--force-build-slice-manifest", action="store_true")
     parser.add_argument("--skip-build-slice-manifest", action="store_true")
     parser.add_argument("--image-size", type=int, default=224)
@@ -40,11 +40,11 @@ def parse_2d_args(model_name, argv=None, output_name=None, default_hparams=None)
 
 def run_2d_model(model_name, argv=None, output_name=None, default_hparams=None):
     args = parse_2d_args(model_name, argv=argv, output_name=output_name, default_hparams=default_hparams)
-    if args.task != "binary":
-        raise ValueError("2D max-slice manifest currently supports binary task only.")
+    if args.slice_manifest is None:
+        args.slice_manifest = DEFAULT_OUTPUT_TABLES[args.task]
     if args.force_build_slice_manifest or (not args.slice_manifest.exists() and not args.skip_build_slice_manifest):
         log("Building 2D maximum cross-section slice manifest: {}".format(args.slice_manifest))
-        build_slice_manifest(output_path=args.slice_manifest)
+        build_slice_manifest(output_path=args.slice_manifest, task=args.task)
     if not args.slice_manifest.exists():
         raise FileNotFoundError("Missing 2D slice manifest: {}".format(args.slice_manifest))
     return run_lightning_training(args, input_dim="2d", manifest_path=args.slice_manifest)

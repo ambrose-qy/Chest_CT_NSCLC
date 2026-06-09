@@ -49,6 +49,8 @@ def parse_args(argv=None):
     parser.add_argument("--image-size", type=int, default=None)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None)
+    parser.add_argument("--enable-grad-cam", type=int, default=1, help="Write Grad-CAM and Grad-CAM++ visualisations.")
+    parser.add_argument("--grad-cam-max-samples", type=int, default=12, help="Maximum test samples visualised with Grad-CAM.")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_REPORT_DIR)
     return parser.parse_args(argv)
 
@@ -120,6 +122,7 @@ def maybe_write_figures(output_dir, labels, probabilities, class_names, task):
 def main(argv=None):
     args = parse_args(argv)
     import_lightning()
+    from lidc_grad_cam import generate_grad_cam_visualizations
     from lidc_lightning_module import LIDCClassifier
 
     config = read_json(args.config) if args.config else {}
@@ -173,6 +176,18 @@ def main(argv=None):
     if roc_rows:
         write_csv(output_dir / "roc_curve.csv", roc_rows)
     maybe_write_figures(output_dir, labels, probabilities, class_names, task)
+    if bool(args.enable_grad_cam):
+        grad_cam_payload = generate_grad_cam_visualizations(
+            model,
+            data_module,
+            output_dir,
+            input_dim=input_dim,
+            task=task,
+            class_names=class_names,
+            max_samples=args.grad_cam_max_samples,
+            device=device,
+        )
+        write_json(output_dir / "grad_cam_summary.json", grad_cam_payload)
 
     log("Evaluation complete")
     log("  checkpoint: {}".format(args.checkpoint))

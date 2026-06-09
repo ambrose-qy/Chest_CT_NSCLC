@@ -17,7 +17,7 @@ import pandas as pd
 # Inputs to modify each time
 # =========================
 
-RUN_DIR = Path("data/processed/model_results/lidc_lightning/3d/resnet/3d_resnet3d_binary_seed2026")
+RUN_DIR = Path("data/processed/model_results/lidc_lightning/3d/vnet/3d_vnet_binary_seed2026")
 
 # Leave these as None for automatic discovery inside RUN_DIR.
 METRICS_CSV = None
@@ -188,7 +188,7 @@ def plot_combined_summary(epoch_df, output_dir):
         ("Loss", "Loss", ["train_loss_epoch", "val_loss", "test_loss"]),
         ("Accuracy", "Accuracy", ["train_accuracy", "val_accuracy", "test_accuracy"]),
         ("F1 Score", "F1", ["train_f1", "val_f1", "test_f1"]),
-        ("Gradient", "Gradient value", ["train_avg_abs_gradient_epoch", "train_gradient_l2_norm_epoch", "train_max_abs_gradient_epoch"]),
+        ("AUROC History", "AUROC", ["train_auc_roc", "val_auc_roc", "test_auc_roc"]),
     ]
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 8))

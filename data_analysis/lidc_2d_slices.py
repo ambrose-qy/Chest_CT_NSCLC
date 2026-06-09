@@ -1,12 +1,12 @@
 """
 Build 2D LIDC-IDRI nodule slice manifests for CNN baselines.
 
-This script consumes the process4 binary train/validation/test split and writes
+This script consumes the process4 train/validation/test split and writes
 one row per ROI with:
 
 * the resolved raw DICOM series directory,
 * the DICOM slice nearest the nodule's largest XML contour slice, and
-* the consensus ROI crop box and binary malignancy label.
+* the consensus ROI crop box and malignancy label.
 
 Run from the repository root:
 
@@ -31,9 +31,16 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIDC_ROOT = PROJECT_ROOT / "data" / "raw" / "LIDC"
 TABLE_DIR = PROJECT_ROOT / "data" / "processed" / "tables"
 
-BINARY_SPLIT_TABLE = TABLE_DIR / "lidc_roi_binary_split_manifest.csv"
+SPLIT_TABLES = {
+    "binary": TABLE_DIR / "lidc_roi_binary_split_manifest.csv",
+    "multiclass": TABLE_DIR / "lidc_roi_multiclass_split_manifest.csv",
+}
 READER_ROI_TABLE = TABLE_DIR / "lidc_roi_reader_annotation_manifest.csv"
-DEFAULT_OUTPUT_TABLE = TABLE_DIR / "lidc_roi_binary_2d_slice_manifest.csv"
+DEFAULT_OUTPUT_TABLES = {
+    "binary": TABLE_DIR / "lidc_roi_binary_2d_slice_manifest.csv",
+    "multiclass": TABLE_DIR / "lidc_roi_multiclass_2d_slice_manifest.csv",
+}
+DEFAULT_OUTPUT_TABLE = DEFAULT_OUTPUT_TABLES["binary"]
 
 
 def log(message):
@@ -268,14 +275,22 @@ def field_value(row, name):
 
 
 def build_slice_manifest(
-    binary_split_path=BINARY_SPLIT_TABLE,
+    split_path=None,
     reader_roi_path=READER_ROI_TABLE,
-    output_path=DEFAULT_OUTPUT_TABLE,
+    output_path=None,
     lidc_root=LIDC_ROOT,
+    task="binary",
     max_rows=None,
 ):
-    binary_rows = read_csv_rows(binary_split_path)
+    if task not in ("binary", "multiclass"):
+        raise ValueError("task must be binary or multiclass.")
+
+    split_path = Path(split_path) if split_path is not None else SPLIT_TABLES[task]
+    output_path = Path(output_path) if output_path is not None else DEFAULT_OUTPUT_TABLES[task]
+    split_rows = read_csv_rows(split_path)
     reader_rows = read_csv_rows(reader_roi_path)
+    split_col = "binary_split" if task == "binary" else "multiclass_split"
+    label_col = "binary_label_id" if task == "binary" else "multiclass_risk_label_id"
 
     reader_rows_by_roi = defaultdict(list)
     for row in reader_rows:
@@ -290,16 +305,16 @@ def build_slice_manifest(
 
     output_rows = []
     failures = defaultdict(int)
-    selected_rows = binary_rows[:max_rows] if max_rows is not None else binary_rows
+    selected_rows = split_rows[:max_rows] if max_rows is not None else split_rows
 
     for index, row in enumerate(selected_rows, start=1):
         if index % 100 == 0:
-            log("  Processed {}/{} binary ROIs".format(index, len(selected_rows)))
+            log("  Processed {}/{} {} ROIs".format(index, len(selected_rows), task))
 
         roi_id = clean_value(row.get("roi_id"))
         series_uid = clean_value(row.get("SeriesInstanceUID"))
-        split_name = clean_value(row.get("binary_split"))
-        label_id = safe_int(row.get("binary_label_id"))
+        split_name = clean_value(row.get(split_col))
+        label_id = safe_int(row.get(label_col))
 
         if not roi_id or not series_uid or not split_name or label_id is None:
             failures["missing_required_fields"] += 1
@@ -331,10 +346,12 @@ def build_slice_manifest(
             "StudyInstanceUID": field_value(row, "StudyInstanceUID"),
             "patient_folder": field_value(row, "patient_folder"),
             "PatientID": field_value(row, "PatientID"),
-            "binary_split": split_name,
+            "binary_split": field_value(row, "binary_split"),
             "binary_label": field_value(row, "binary_label"),
-            "binary_label_id": label_id,
+            "binary_label_id": field_value(row, "binary_label_id"),
+            "multiclass_split": field_value(row, "multiclass_split"),
             "multiclass_risk_label": field_value(row, "multiclass_risk_label"),
+            "multiclass_risk_label_id": field_value(row, "multiclass_risk_label_id"),
             "reader_count": field_value(row, "reader_count"),
             "median_malignancy_score": field_value(row, "median_malignancy_score"),
             "label_confidence": field_value(row, "label_confidence"),
@@ -367,8 +384,8 @@ def build_slice_manifest(
 
     write_csv(output_path, output_rows)
     log("")
-    log("2D LIDC binary slice manifest complete")
-    log("  input binary ROIs: {}".format(len(selected_rows)))
+    log("2D LIDC {} slice manifest complete".format(task))
+    log("  input {} ROIs: {}".format(task, len(selected_rows)))
     log("  output rows: {}".format(len(output_rows)))
     log("  failures: {}".format(dict(failures)))
     log("  output: {}".format(output_path))
@@ -376,10 +393,12 @@ def build_slice_manifest(
 
 
 def parse_args(argv=None):
-    parser = argparse.ArgumentParser(description="Build 2D DICOM slice manifest for LIDC-IDRI binary CNN baselines.")
-    parser.add_argument("--binary-split", type=Path, default=BINARY_SPLIT_TABLE, help="Process4 binary split manifest.")
+    parser = argparse.ArgumentParser(description="Build 2D DICOM slice manifest for LIDC-IDRI CNN baselines.")
+    parser.add_argument("--task", default="binary", choices=["binary", "multiclass"], help="Classification task.")
+    parser.add_argument("--split", type=Path, default=None, help="Process4 split manifest. Defaults to the task-specific table.")
+    parser.add_argument("--binary-split", type=Path, default=None, help="Deprecated alias for --split.")
     parser.add_argument("--reader-roi", type=Path, default=READER_ROI_TABLE, help="Process3 reader ROI manifest.")
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT_TABLE, help="Output 2D slice manifest CSV.")
+    parser.add_argument("--output", type=Path, default=None, help="Output 2D slice manifest CSV.")
     parser.add_argument("--lidc-root", type=Path, default=LIDC_ROOT, help="Root containing raw LIDC manifest data.")
     parser.add_argument("--max-rows", type=int, default=None, help="Optional debug limit.")
     return parser.parse_args(argv)
@@ -388,10 +407,11 @@ def parse_args(argv=None):
 def main(argv=None):
     args = parse_args(argv)
     build_slice_manifest(
-        binary_split_path=args.binary_split,
+        split_path=args.split or args.binary_split,
         reader_roi_path=args.reader_roi,
         output_path=args.output,
         lidc_root=args.lidc_root,
+        task=args.task,
         max_rows=args.max_rows,
     )
 
