@@ -34,14 +34,18 @@ def default_grid(input_dim):
             "weight_decay": [1e-4],
             "batch_size": [16],
             "scheduler": ["cosine", "plateau"],
+            "attention": ["none", "cbam"],
+            "fusion": ["none"],
         }
     return {
         "model": ["resnet3d", "vnet"],
         "lr": [1e-4, 3e-4],
         "weight_decay": [1e-4],
         "batch_size": [4],
-        "scheduler": ["cosine", "plateau"],
-    }
+            "scheduler": ["cosine", "plateau"],
+            "attention": ["none", "cbam"],
+            "fusion": ["none", "multiscale"],
+        }
 
 
 def load_grid(path, input_dim):
@@ -79,6 +83,8 @@ def build_overrides(args, config, run_output_dir):
         "lr": config["lr"],
         "weight_decay": config["weight_decay"],
         "scheduler": config["scheduler"],
+        "attention": config.get("attention", "none"),
+        "fusion": config.get("fusion", "none"),
         "early_stop_patience": args.early_stop_patience,
         "seed": args.seed,
         "output_dir": run_output_dir,
@@ -126,6 +132,8 @@ def main(argv=None):
             "weight_decay": config["weight_decay"],
             "batch_size": config["batch_size"],
             "scheduler": config["scheduler"],
+            "attention": config.get("attention", "none"),
+            "fusion": config.get("fusion", "none"),
             "trainer_function": trainer_for_model(args.input_dim, config["model"]).__name__,
             "overrides": json.dumps({key: str(value) for key, value in overrides.items()}, sort_keys=True),
             "status": "planned",

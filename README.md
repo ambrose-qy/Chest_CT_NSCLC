@@ -58,7 +58,7 @@ Chest_CT_NSCLC/
 - `data_analysis/LIDC_process2.py` clusters multi-reader XML annotations and scores annotation consistency.
 - `data_analysis/LIDC_process3.py` extracts agreed nodule ROI manifests for nodules >=3 mm approved by at least 3 radiologists.
 - `data_analysis/LIDC_process4.py` constructs malignancy labels and patient-level train/validation/test splits using 70/10/20 proportions with risk-label balancing.
-- `data_analysis/LIDC_process5.py` exports standardised 3D nodule ROI volume files, label manifests, preprocessing QC, and outlier-handling reports.
+- `data_analysis/LIDC_process5.py` exports compressed `.npz` 3D nodule ROI volume files as fixed 64 x 64 x 64 voxel-coordinate crops centred on the ROI manifest nodule centre, with label manifests, preprocessing QC, and outlier-handling reports.
 - `data_analysis/LIDC_process6.py` writes missing-data, outlier, and conservative imputation-planning tables for report/model use.
 - `data_analysis/LIDC_2d_resnet.py`, `LIDC_2d_densenet.py`, `LIDC_3d_resnet.py`, and `LIDC_3d_vnet.py` are model-named training entry points that share the same preprocessing, augmentation, logging, early stopping, scheduling, and evaluation code.
 - `data_analysis/LIDC_evaluate_lightning.py` evaluates a Lightning checkpoint on the independent test set and writes metrics, predictions, confusion matrix, and ROC data.
@@ -223,9 +223,13 @@ For ordinary tuning, edit the `HYPERPARAMETERS` dictionary near the top of each 
 
 The default normalization mode is `normalization_mean = "auto"` and `normalization_std = "auto"`, which computes mean/std from the training split and applies the same statistics to train/validation/test data. Current augmentations include rotation, flipping, scaling, Gaussian noise, intensity shift, contrast jitter, and cutout. Class weighting defaults to `class_weight_mode = "balanced"`; use `class_weight_mode = "custom"` with `custom_class_weights = "w0,w1"` or `"w0,w1,w2"` for manual binary or multiclass weights.
 
-Each run prints and records the active task and split source, for example `Task: binary using split column 'binary_split'`. For 3D training, set `task` to `binary` or `multiclass`; the saved `config.json` records `task`, `split_column`, and `label_column`. The 2D maximum-slice workflow currently uses the binary 2D manifest.
+Attention and fusion experiments are available through the shared model factory. Use `--attention cbam` for the recommended CBAM module, or `--attention se` for an SE comparison. For 3D models, `--fusion multiscale` enables multiscale feature fusion in ResNet3D and `--fusion multiview` enables axial/coronal/sagittal multi-view fusion. The model-named defaults now use CBAM, with 3D ResNet defaulting to multiscale fusion.
+
+Each run prints and records the active task and split source, for example `Task: binary using split column 'binary_split'`. For 2D and 3D training, set `task` to `binary` or `multiclass`; the saved `config.json` records `task`, `split_column`, and `label_column`. The 2D maximum-slice workflow writes task-specific binary and multiclass manifests.
 
 Each run writes checkpoints, `config.json`, `hparams.json`, `best_config.json`, `test_metrics.json`, `test_confusion_matrix.csv`, `test_confusion_matrix.json`, `test_confusion_matrix.png`, and Lightning CSV logs under `data/processed/model_results/lidc_lightning/<2d-or-3d>/<model-family>/<run-name>/`. The CSV logs include learning rate, loss, accuracy, precision, recall, F1, AUC-ROC, label counts, dropout and clipping hyperparameters, average absolute gradient, gradient L2 norm, maximum absolute gradient, and parameter L2 norm.
+
+Grad-CAM and Grad-CAM++ outputs are written after training when `enable_grad_cam` is enabled. The visualisation step prioritises incorrectly predicted test cases, writes overlays, records attention peak/bounding-box locations, and summarises failure patterns such as small nodules, calcification-marked false positives, low reader consistency, and false negative/false positive class transitions.
 
 On Windows, if `conda run` fails while printing Lightning progress output because of console encoding, run the environment Python directly instead:
 
@@ -243,6 +247,27 @@ Aggregate completed runs:
 
 ```powershell
 conda run -n torch-gpu python data_analysis\LIDC_compare_lightning_experiments.py
+```
+
+Plan or run the full required baseline matrix covering 2D ResNet, 2D DenseNet, 3D ResNet, and 3D VNet for both binary and multiclass tasks:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_run_required_experiments.py
+conda run -n torch-gpu python data_analysis\LIDC_run_required_experiments.py --execute
+```
+
+Plan or run ablations for a selected model/task. The default ablations include no augmentation, individual augmentation removals, no class weights, scheduler variants, and no gradient clipping:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_ablation_lightning.py --input-dim 3d --model resnet3d --task multiclass
+conda run -n torch-gpu python data_analysis\LIDC_ablation_lightning.py --input-dim 3d --model resnet3d --task multiclass --execute
+```
+
+Export LUNA16 nodule-centred ROI cubes and run all completed LIDC models on the external LUNA distribution. LUNA16 does not provide LIDC malignancy labels, so these reports measure external-domain prediction behaviour, confidence, entropy, and diameter-stratified prediction distributions rather than supervised accuracy/F1:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LUNA_export_lidc_external_rois.py
+conda run -n torch-gpu python data_analysis\LIDC_validate_luna_external.py --all-runs
 ```
 
 ## LUNA16 Workflow
@@ -278,6 +303,8 @@ Run full subset0-4 preprocessing. Add `--save-volumes` only when there is enough
 conda run -n torch-gpu python data_analysis\LUNA_process.py --save-volumes
 conda run -n torch-gpu python data_analysis\LUNA_process2.py --save-volumes
 ```
+
+The LIDC external-validation ROI exporter requires those saved LUNA full-volume `.npz` files.
 
 LUNA outputs are written under:
 

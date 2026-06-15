@@ -6,6 +6,7 @@ Edit the input block below each time you want to plot another run.
 
 from __future__ import print_function
 
+import argparse
 import json
 from pathlib import Path
 
@@ -17,7 +18,7 @@ import pandas as pd
 # Inputs to modify each time
 # =========================
 
-RUN_DIR = Path("data/processed/model_results/lidc_lightning/3d/vnet/3d_vnet_binary_seed2026")
+RUN_DIR = None
 
 # Leave these as None for automatic discovery inside RUN_DIR.
 METRICS_CSV = None
@@ -35,6 +36,7 @@ FIGSIZE = (7, 4.5)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+EXPERIMENT_ROOT = PROJECT_ROOT / "data" / "processed" / "model_results" / "lidc_lightning"
 
 
 def project_path(path):
@@ -54,6 +56,16 @@ def latest_file(root, pattern):
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)[0]
 
 
+def run_dir_from_metrics(metrics_csv):
+    metrics_csv = Path(metrics_csv)
+    for parent in metrics_csv.parents:
+        if (parent / "config.json").exists():
+            return parent
+    if len(metrics_csv.parents) >= 3:
+        return metrics_csv.parents[2]
+    return metrics_csv.parent
+
+
 def read_json(path):
     if not path or not Path(path).exists():
         return {}
@@ -68,16 +80,37 @@ def first_existing(*paths):
     return None
 
 
-def resolve_inputs():
-    run_dir = project_path(RUN_DIR)
-    metrics_csv = first_existing(project_path(METRICS_CSV), latest_file(run_dir, "metrics.csv"))
-    config_json = first_existing(project_path(CONFIG_JSON), run_dir / "config.json")
-    output_dir = project_path(OUTPUT_DIR) if OUTPUT_DIR else run_dir / "figures"
-    roc_csv = first_existing(project_path(ROC_CSV), latest_file(run_dir, "roc_curve.csv"))
-    predictions_csv = first_existing(project_path(PREDICTIONS_CSV), latest_file(run_dir, "test_predictions.csv"))
+def resolve_inputs(args=None):
+    args = args or argparse.Namespace()
+    run_dir = project_path(getattr(args, "run_dir", None)) or project_path(RUN_DIR)
+    metrics_csv = first_existing(
+        project_path(getattr(args, "metrics_csv", None)),
+        project_path(METRICS_CSV),
+        latest_file(run_dir, "metrics.csv"),
+    )
 
     if metrics_csv is None:
-        raise FileNotFoundError("Could not find metrics.csv. Set RUN_DIR or METRICS_CSV at the top of this file.")
+        metrics_csv = latest_file(EXPERIMENT_ROOT, "metrics.csv")
+        if metrics_csv is not None:
+            run_dir = run_dir_from_metrics(metrics_csv)
+
+    if metrics_csv is None:
+        raise FileNotFoundError(
+            "Could not find metrics.csv. Pass --run-dir, pass --metrics-csv, "
+            "or train a model under {} first.".format(EXPERIMENT_ROOT)
+        )
+
+    if run_dir is None or not Path(run_dir).exists():
+        run_dir = run_dir_from_metrics(metrics_csv)
+
+    config_json = first_existing(
+        project_path(getattr(args, "config_json", None)),
+        project_path(CONFIG_JSON),
+        run_dir / "config.json",
+    )
+    output_dir = project_path(getattr(args, "output_dir", None)) or (project_path(OUTPUT_DIR) if OUTPUT_DIR else run_dir / "figures")
+    roc_csv = first_existing(project_path(ROC_CSV), latest_file(run_dir, "roc_curve.csv"))
+    predictions_csv = first_existing(project_path(PREDICTIONS_CSV), latest_file(run_dir, "test_predictions.csv"))
 
     output_dir.mkdir(parents=True, exist_ok=True)
     return run_dir, metrics_csv, config_json, roc_csv, predictions_csv, output_dir
@@ -307,8 +340,75 @@ def plot_roc_from_predictions(predictions_csv, task, output_dir):
     return True
 
 
-def main():
-    run_dir, metrics_csv, config_json, roc_csv, predictions_csv, output_dir = resolve_inputs()
+def metric_value(df, column, mode="last"):
+    if column not in df.columns:
+        return np.nan
+    values = pd.to_numeric(df[column], errors="coerce").dropna()
+    if values.empty:
+        return np.nan
+    if mode == "max":
+        return float(values.max())
+    if mode == "min":
+        return float(values.min())
+    return float(values.iloc[-1])
+
+
+def overfit_diagnostics(epoch_df):
+    train_auc = metric_value(epoch_df, "train_auc_roc")
+    val_auc = metric_value(epoch_df, "val_auc_roc")
+    test_auc = metric_value(epoch_df, "test_auc_roc")
+    train_loss = metric_value(epoch_df, "train_loss_epoch")
+    val_loss = metric_value(epoch_df, "val_loss")
+    test_loss = metric_value(epoch_df, "test_loss")
+    train_f1 = metric_value(epoch_df, "train_f1")
+    val_f1 = metric_value(epoch_df, "val_f1")
+    test_f1 = metric_value(epoch_df, "test_f1")
+
+    rows = [
+        {"metric": "final_train_auc_roc", "value": train_auc},
+        {"metric": "final_val_auc_roc", "value": val_auc},
+        {"metric": "best_val_auc_roc", "value": metric_value(epoch_df, "val_auc_roc", mode="max")},
+        {"metric": "test_auc_roc", "value": test_auc},
+        {"metric": "train_val_auc_gap_final", "value": train_auc - val_auc if np.isfinite(train_auc) and np.isfinite(val_auc) else np.nan},
+        {"metric": "best_val_test_auc_gap", "value": metric_value(epoch_df, "val_auc_roc", mode="max") - test_auc if np.isfinite(test_auc) else np.nan},
+        {"metric": "final_train_f1", "value": train_f1},
+        {"metric": "final_val_f1", "value": val_f1},
+        {"metric": "test_f1", "value": test_f1},
+        {"metric": "train_val_f1_gap_final", "value": train_f1 - val_f1 if np.isfinite(train_f1) and np.isfinite(val_f1) else np.nan},
+        {"metric": "final_train_loss", "value": train_loss},
+        {"metric": "final_val_loss", "value": val_loss},
+        {"metric": "test_loss", "value": test_loss},
+        {"metric": "val_train_loss_gap_final", "value": val_loss - train_loss if np.isfinite(train_loss) and np.isfinite(val_loss) else np.nan},
+    ]
+
+    interpretation = []
+    auc_gap = rows[4]["value"]
+    val_test_gap = rows[5]["value"]
+    loss_gap = rows[13]["value"]
+    if np.isfinite(auc_gap) and auc_gap > 0.10:
+        interpretation.append("train_auc_substantially_above_val_auc")
+    if np.isfinite(loss_gap) and loss_gap > 0.10:
+        interpretation.append("val_loss_above_train_loss")
+    if np.isfinite(val_test_gap) and val_test_gap > 0.10:
+        interpretation.append("validation_to_test_generalisation_gap")
+    if not interpretation:
+        interpretation.append("no_strong_overfit_signal_in_available_metrics")
+    rows.append({"metric": "interpretation", "value": ";".join(interpretation)})
+    return rows
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Plot LIDC Lightning training logs.")
+    parser.add_argument("--run-dir", type=Path, default=None, help="Run directory containing config.json and logs/**/metrics.csv.")
+    parser.add_argument("--metrics-csv", type=Path, default=None, help="Direct path to Lightning metrics.csv.")
+    parser.add_argument("--config-json", type=Path, default=None, help="Optional direct path to config.json.")
+    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for figures and compact CSVs.")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    run_dir, metrics_csv, config_json, roc_csv, predictions_csv, output_dir = resolve_inputs(args)
     config = read_json(config_json)
     task = infer_task(config, predictions_csv)
 
@@ -320,6 +420,11 @@ def main():
 
     _, epoch_df = load_epoch_metrics(metrics_csv)
     epoch_df.to_csv(output_dir / "epoch_metrics_compact.csv", index=False)
+    diagnostics = overfit_diagnostics(epoch_df)
+    pd.DataFrame(diagnostics).to_csv(output_dir / "overfit_diagnostics.csv", index=False)
+    with (output_dir / "overfit_diagnostics.json").open("w", encoding="utf-8") as f:
+        json.dump(diagnostics, f, indent=2)
+    print("Wrote {}".format(output_dir / "overfit_diagnostics.csv"))
     plot_training_curves(epoch_df, output_dir)
     plot_combined_summary(epoch_df, output_dir)
 

@@ -511,6 +511,8 @@ def summarize_cluster(cluster_id, rows):
         "morphology_consistent": morphology_consistent,
         "overall_consistency": overall_consistency,
         "majority_malignancy": majority_value(rows, "malignancy"),
+        "majority_internal_structure": majority_value(rows, "internal_structure"),
+        "majority_calcification": majority_value(rows, "calcification"),
         "majority_sphericity": majority_value(rows, "sphericity"),
         "majority_margin": majority_value(rows, "margin"),
         "majority_lobulation": majority_value(rows, "lobulation"),

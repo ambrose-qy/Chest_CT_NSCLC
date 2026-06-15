@@ -4,6 +4,7 @@ Shared training helpers for LIDC-IDRI Lightning scripts.
 
 from __future__ import print_function
 
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,9 @@ from lidc_lightning_utils import (
     write_json,
 )
 from lidc_lightning_models import count_parameters
+
+
+FIXED_MULTICLASS_CLASS_WEIGHTS = [1.5, 0.5, 1.8]
 
 
 def class_weights_from_counts(counts, num_classes):
@@ -48,6 +52,10 @@ def resolve_class_weights(args, counts, num_classes):
     mode = getattr(args, "class_weight_mode", "balanced")
     if mode == "none":
         return None
+    if mode == "fixed_multiclass":
+        if num_classes == 3:
+            return list(FIXED_MULTICLASS_CLASS_WEIGHTS)
+        return sqrt_class_weights_from_counts(counts, num_classes)
     if mode == "custom":
         weights = parse_class_weights(getattr(args, "custom_class_weights", None))
         if weights is None or len(weights) != num_classes:
@@ -166,6 +174,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         augment_rotate=getattr(args, "augment_rotate", True),
         augment_flip=getattr(args, "augment_flip", True),
         augment_scale=getattr(args, "augment_scale", True),
+        augment_scale_range=getattr(args, "augment_scale_range", 0.10),
         augment_noise_std=getattr(args, "augment_noise_std", 0.02),
         augment_intensity_shift=getattr(args, "augment_intensity_shift", 0.05),
         augment_contrast_range=getattr(args, "augment_contrast_range", 0.10),
@@ -189,9 +198,12 @@ def run_lightning_training(args, input_dim, manifest_path):
         max_epochs=args.epochs,
         dropout=getattr(args, "dropout", 0.2),
         gradient_clip_val=getattr(args, "gradient_clip_val", 0.0),
+        attention=getattr(args, "attention", "none"),
+        fusion=getattr(args, "fusion", "none"),
     )
 
-    run_name = "{}_{}_{}_seed{}".format(input_dim, args.model.lower(), args.task, args.seed)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    run_name = "{}_{}_{}_seed{}_{}".format(input_dim, args.model.lower(), args.task, args.seed, timestamp)
     output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -245,6 +257,7 @@ def run_lightning_training(args, input_dim, manifest_path):
             "rotate": getattr(args, "augment_rotate", True),
             "flip": getattr(args, "augment_flip", True),
             "scale": getattr(args, "augment_scale", True),
+            "scale_range": getattr(args, "augment_scale_range", 0.10),
             "noise_std": getattr(args, "augment_noise_std", 0.02),
             "intensity_shift": getattr(args, "augment_intensity_shift", 0.05),
             "contrast_range": getattr(args, "augment_contrast_range", 0.10),
@@ -255,6 +268,8 @@ def run_lightning_training(args, input_dim, manifest_path):
         "enable_grad_cam": bool(getattr(args, "enable_grad_cam", True)),
         "grad_cam_max_samples": getattr(args, "grad_cam_max_samples", 12),
         "dropout": getattr(args, "dropout", 0.2),
+        "attention": getattr(args, "attention", "none"),
+        "fusion": getattr(args, "fusion", "none"),
         "parameter_count": count_parameters(model.model),
         "monitor_metric": monitor_metric,
     }
@@ -327,7 +342,7 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--precision", default="32-true", help="Lightning precision setting, e.g. 32-true or 16-mixed.")
     parser.add_argument("--max-samples-per-split", type=int, default=None, help="Debug limit per split.")
     parser.add_argument("--no-class-weights", action="store_true")
-    parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "custom", "none"])
+    parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "fixed_multiclass", "custom", "none"])
     parser.add_argument("--custom-class-weights", default=None, help="Comma-separated class weights, e.g. 1.0,1.5.")
     parser.add_argument("--normalization-mean", default="auto", help="auto or scalar/list mean for normalized HU values.")
     parser.add_argument("--normalization-std", default="auto", help="auto or scalar/list std for normalized HU values.")
@@ -335,11 +350,14 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--augment-rotate", type=int, default=1)
     parser.add_argument("--augment-flip", type=int, default=1)
     parser.add_argument("--augment-scale", type=int, default=1)
+    parser.add_argument("--augment-scale-range", type=float, default=0.10)
     parser.add_argument("--augment-noise-std", type=float, default=0.02)
     parser.add_argument("--augment-intensity-shift", type=float, default=0.05)
     parser.add_argument("--augment-contrast-range", type=float, default=0.10)
     parser.add_argument("--augment-cutout-fraction", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--attention", default="none", choices=["none", "se", "cbam"], help="Attention module. CBAM is recommended for 3D medical imaging.")
+    parser.add_argument("--fusion", default="none", choices=["none", "multiscale", "multiview"], help="3D feature fusion mode.")
     parser.add_argument("--gradient-clip-val", type=float, default=0.0)
     parser.add_argument("--gradient-clip-algorithm", default="norm", choices=["norm", "value"])
     parser.add_argument("--enable-grad-cam", type=int, default=1, help="Write Grad-CAM and Grad-CAM++ visualisations after test.")

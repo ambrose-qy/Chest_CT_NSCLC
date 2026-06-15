@@ -21,6 +21,8 @@ def safe_name(value):
 
 def target_layer_for_model(model):
     backbone = getattr(model, "model", model)
+    if hasattr(backbone, "model"):
+        backbone = backbone.model
     if hasattr(backbone, "layer4"):
         return backbone.layer4[-1]
     if hasattr(backbone, "features") and hasattr(backbone.features, "denseblock4"):
@@ -29,6 +31,8 @@ def target_layer_for_model(model):
         return backbone.layers[-1]
     if hasattr(backbone, "enc4"):
         return backbone.enc4
+    if hasattr(backbone, "axial"):
+        return backbone.axial[5]
     raise ValueError("Could not infer a Grad-CAM target layer for {}.".format(backbone.__class__.__name__))
 
 
@@ -91,6 +95,8 @@ def grad_cam_plus_plus_from_tensors(activations, gradients):
 
 def resize_cam(cam, image):
     spatial_size = tuple(image.shape[2:])
+    if cam.dim() == 4 and len(spatial_size) == 3:
+        spatial_size = spatial_size[-2:]
     mode = "trilinear" if len(spatial_size) == 3 else "bilinear"
     return F.interpolate(cam, size=spatial_size, mode=mode, align_corners=False)
 
@@ -141,15 +147,100 @@ def cam_area(cam_array, threshold_quantile=0.85):
     return result
 
 
+def batch_metadata(batch, index):
+    meta = batch.get("metadata", {})
+    if not isinstance(meta, dict):
+        return {}
+    out = {}
+    for key, value in meta.items():
+        if isinstance(value, (list, tuple)):
+            out[key] = value[index] if index < len(value) else ""
+        else:
+            out[key] = value
+    return out
+
+
+def failure_patterns(true_label, predicted_label, class_names, metadata):
+    if true_label == predicted_label:
+        return []
+
+    patterns = ["misclassified"]
+    diameter = metadata.get("median_max_diameter_mm")
+    try:
+        diameter = float(diameter)
+    except Exception:
+        diameter = None
+    if diameter is not None and diameter < 6.0:
+        patterns.append("small_nodule_lt_6mm")
+
+    calcification = str(metadata.get("majority_calcification", "")).strip()
+    if calcification:
+        patterns.append("calcification_score_{}".format(calcification))
+
+    texture = str(metadata.get("majority_texture", "")).strip()
+    if texture:
+        patterns.append("texture_score_{}".format(texture))
+
+    true_name = class_names[true_label] if true_label < len(class_names) else str(true_label)
+    pred_name = class_names[predicted_label] if predicted_label < len(class_names) else str(predicted_label)
+    if true_name in ("benign", "low_risk") and pred_name in ("malignant", "high_risk"):
+        patterns.append("false_positive_as_malignant_or_high_risk")
+        if calcification:
+            patterns.append("calcified_nodule_flagged_as_malignant_pattern")
+    if true_name in ("malignant", "high_risk") and pred_name in ("benign", "low_risk"):
+        patterns.append("false_negative_as_benign_or_low_risk")
+
+    if str(metadata.get("overall_consistency", "")).strip().lower() == "low":
+        patterns.append("low_reader_consistency")
+    return patterns
+
+
+def collect_grad_cam_samples(model, data_module, class_names, max_samples, device):
+    incorrect = []
+    correct = []
+    with torch.no_grad():
+        for batch in data_module.test_dataloader():
+            images = batch["image"].to(device)
+            labels = batch["label"]
+            logits = model(images)
+            probabilities = torch.softmax(logits, dim=1).detach().cpu()
+            predictions = probabilities.argmax(dim=1)
+            for item_idx in range(images.size(0)):
+                true_label = int(labels[item_idx].detach().cpu())
+                predicted_label = int(predictions[item_idx])
+                sample = {
+                    "image": images[item_idx:item_idx + 1].detach().cpu(),
+                    "true_label": true_label,
+                    "predicted_label": predicted_label,
+                    "probabilities": probabilities[item_idx].numpy(),
+                    "roi_id": batch["roi_id"][item_idx],
+                    "patient_id": batch["patient_id"][item_idx],
+                    "metadata": batch_metadata(batch, item_idx),
+                }
+                if true_label != predicted_label:
+                    if len(incorrect) < int(max_samples):
+                        incorrect.append(sample)
+                elif len(correct) < int(max_samples):
+                    correct.append(sample)
+    return (incorrect + correct)[:int(max_samples)]
+
+
 def save_overlay(path, image_array, cam_array, title, slice_index=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     if image_array.ndim == 3:
+        if cam_array.ndim == 2:
+            image_array = image_array[image_array.shape[0] // 2]
+        else:
+            if slice_index is None:
+                slice_index = image_array.shape[0] // 2
+            image_array = image_array[slice_index]
+            cam_array = cam_array[slice_index]
+    elif cam_array.ndim == 3:
         if slice_index is None:
-            slice_index = image_array.shape[0] // 2
-        image_array = image_array[slice_index]
+            slice_index = cam_array.shape[0] // 2
         cam_array = cam_array[slice_index]
 
     fig, ax = plt.subplots(figsize=(5, 5))
@@ -181,72 +272,94 @@ def generate_grad_cam_visualizations(
     target_layer = target_layer_for_model(model)
     extractor = CamExtractor(model, target_layer)
     rows = []
-    sample_count = 0
+    failure_rows = []
+    samples = collect_grad_cam_samples(model, data_module, class_names, max_samples, device)
 
     try:
-        for batch in data_module.test_dataloader():
-            images = batch["image"]
-            labels = batch["label"]
-            for item_idx in range(images.size(0)):
-                if sample_count >= int(max_samples):
-                    break
+        for sample_count, sample in enumerate(samples):
+            image = sample["image"].to(device)
+            true_label = sample["true_label"]
+            predicted_label = sample["predicted_label"]
+            roi_id = sample["roi_id"]
+            patient_id = sample["patient_id"]
+            metadata = sample.get("metadata", {})
 
-                image = images[item_idx:item_idx + 1].to(device)
-                true_label = int(labels[item_idx].detach().cpu())
-                roi_id = batch["roi_id"][item_idx]
-                patient_id = batch["patient_id"][item_idx]
+            with torch.enable_grad():
+                target_class = predicted_label
+                logits, activations, gradients = extractor.compute(image, target_class)
+                probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+                cams = {
+                    "grad_cam": resize_cam(grad_cam_from_tensors(activations, gradients), image),
+                    "grad_cam_plus_plus": resize_cam(grad_cam_plus_plus_from_tensors(activations, gradients), image),
+                }
 
-                with torch.enable_grad():
-                    logits = model(image)
-                    probabilities = torch.softmax(logits, dim=1)
-                    predicted_label = int(probabilities.argmax(dim=1).item())
-                    target_class = predicted_label
-                    logits, activations, gradients = extractor.compute(image, target_class)
-                    probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
+            patterns = failure_patterns(true_label, predicted_label, class_names, metadata)
+            image_array = image_to_numpy(image)
+            for method, cam_tensor in cams.items():
+                cam_array = cam_tensor.detach().cpu().numpy()[0, 0]
+                area = cam_area(cam_array)
+                slice_index = area.get("peak_z")
+                file_stem = "{}__{}__{}".format(sample_count, safe_name(roi_id), method)
+                png_path = output_dir / "{}.png".format(file_stem)
+                title = "{} target={}".format(method.replace("_", "-"), class_names[target_class])
+                save_overlay(png_path, image_array, cam_array, title, slice_index=slice_index)
 
-                    cams = {
-                        "grad_cam": resize_cam(grad_cam_from_tensors(activations, gradients), image),
-                        "grad_cam_plus_plus": resize_cam(grad_cam_plus_plus_from_tensors(activations, gradients), image),
-                    }
+                row = {
+                    "sample_index": sample_count,
+                    "method": method,
+                    "input_dim": input_dim,
+                    "task": task,
+                    "roi_id": roi_id,
+                    "patient_id": patient_id,
+                    "true_label_id": true_label,
+                    "true_label": class_names[true_label] if true_label < len(class_names) else str(true_label),
+                    "predicted_label_id": predicted_label,
+                    "predicted_label": class_names[predicted_label] if predicted_label < len(class_names) else str(predicted_label),
+                    "is_correct": true_label == predicted_label,
+                    "failure_patterns": ";".join(patterns),
+                    "target_class_id": target_class,
+                    "target_class": class_names[target_class] if target_class < len(class_names) else str(target_class),
+                    "target_probability": float(probabilities[target_class]),
+                    "visualization_path": str(png_path),
+                }
+                row.update(metadata)
+                row.update(area)
+                rows.append(row)
 
-                image_array = image_to_numpy(image)
-                for method, cam_tensor in cams.items():
-                    cam_array = cam_tensor.detach().cpu().numpy()[0, 0]
-                    area = cam_area(cam_array)
-                    slice_index = area.get("peak_z")
-                    file_stem = "{}__{}__{}".format(sample_count, safe_name(roi_id), method)
-                    png_path = output_dir / "{}.png".format(file_stem)
-                    title = "{} target={}".format(method.replace("_", "-"), class_names[target_class])
-                    save_overlay(png_path, image_array, cam_array, title, slice_index=slice_index)
-
-                    row = {
-                        "sample_index": sample_count,
-                        "method": method,
-                        "input_dim": input_dim,
-                        "task": task,
-                        "roi_id": roi_id,
-                        "patient_id": patient_id,
-                        "true_label_id": true_label,
-                        "true_label": class_names[true_label] if true_label < len(class_names) else str(true_label),
-                        "predicted_label_id": predicted_label,
-                        "predicted_label": class_names[predicted_label] if predicted_label < len(class_names) else str(predicted_label),
-                        "target_class_id": target_class,
-                        "target_class": class_names[target_class] if target_class < len(class_names) else str(target_class),
-                        "target_probability": float(probabilities[target_class]),
-                        "visualization_path": str(png_path),
-                    }
-                    row.update(area)
-                    rows.append(row)
-
-                sample_count += 1
-            if sample_count >= int(max_samples):
-                break
+            if true_label != predicted_label:
+                failure_row = {
+                    "sample_index": sample_count,
+                    "input_dim": input_dim,
+                    "task": task,
+                    "roi_id": roi_id,
+                    "patient_id": patient_id,
+                    "true_label": class_names[true_label] if true_label < len(class_names) else str(true_label),
+                    "predicted_label": class_names[predicted_label] if predicted_label < len(class_names) else str(predicted_label),
+                    "predicted_probability": float(probabilities[predicted_label]),
+                    "failure_patterns": ";".join(patterns),
+                }
+                failure_row.update(metadata)
+                failure_rows.append(failure_row)
     finally:
         extractor.close()
 
     write_csv(output_dir / "grad_cam_interest_areas.csv", rows)
+    write_csv(output_dir / "grad_cam_failure_cases.csv", failure_rows)
+    write_csv(output_dir / "grad_cam_failure_pattern_summary.csv", summarize_failure_patterns(failure_rows))
     return {
         "grad_cam_dir": str(output_dir),
         "grad_cam_interest_areas": str(output_dir / "grad_cam_interest_areas.csv"),
-        "grad_cam_sample_count": sample_count,
+        "grad_cam_failure_cases": str(output_dir / "grad_cam_failure_cases.csv"),
+        "grad_cam_failure_pattern_summary": str(output_dir / "grad_cam_failure_pattern_summary.csv"),
+        "grad_cam_sample_count": len(samples),
     }
+
+
+def summarize_failure_patterns(failure_rows):
+    counts = {}
+    for row in failure_rows:
+        for pattern in str(row.get("failure_patterns", "")).split(";"):
+            pattern = pattern.strip()
+            if pattern:
+                counts[pattern] = counts.get(pattern, 0) + 1
+    return [{"failure_pattern": key, "count": value} for key, value in sorted(counts.items(), key=lambda item: (-item[1], item[0]))]

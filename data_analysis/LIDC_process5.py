@@ -15,8 +15,9 @@ It also writes label and quality-assessment tables:
     data/processed/tables/lidc_roi_3d_preprocessing_summary.csv
     data/processed/tables/lidc_roi_3d_preprocessing_criteria.csv
 
-The output volumes are HU-windowed, normalised to [0, 1], and resized to a
-fixed z/y/x shape. Run from the repository root:
+The output volumes are fixed-size voxel-coordinate crops centred on each
+manifest ROI centre, then HU-windowed and normalised to [0, 1]. Run from the
+repository root:
 
     conda run -n torch-gpu python data_analysis/LIDC_process5.py
 
@@ -30,7 +31,6 @@ from __future__ import print_function
 import argparse
 import csv
 import json
-import math
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -52,6 +52,7 @@ PREPROCESSING_QC_TABLE = TABLE_DIR / "lidc_roi_3d_preprocessing_qc.csv"
 OUTLIER_REPORT_TABLE = TABLE_DIR / "lidc_roi_3d_outlier_report.csv"
 PREPROCESSING_SUMMARY_TABLE = TABLE_DIR / "lidc_roi_3d_preprocessing_summary.csv"
 PREPROCESSING_CRITERIA_TABLE = TABLE_DIR / "lidc_roi_3d_preprocessing_criteria.csv"
+ROI_CROP_MARGIN_MM = 2.0
 
 
 def log(message):
@@ -152,7 +153,7 @@ def build_series_dir_map(manifest_root):
 def parse_shape(text):
     parts = [part.strip() for part in clean_value(text).replace("x", ",").split(",") if part.strip()]
     if len(parts) != 3:
-        raise ValueError("Volume shape must have z,y,x, for example 32,64,64")
+        raise ValueError("Volume shape must have z,y,x, for example 64,64,64")
     values = tuple(int(part) for part in parts)
     if min(values) <= 0:
         raise ValueError("Volume shape dimensions must be positive.")
@@ -256,89 +257,116 @@ def clamp_int(value, low, high):
     return max(low, min(int(value), high))
 
 
-def crop_roi_volume(row, series_data, np):
+def fixed_window(center, size, limit):
+    center = int(round(center))
+    start = center - int(size) // 2
+    stop = start + int(size)
+    src_start = max(start, 0)
+    src_stop = min(stop, int(limit))
+    dst_start = src_start - start
+    dst_stop = dst_start + max(0, src_stop - src_start)
+    return start, stop, src_start, src_stop, dst_start, dst_stop
+
+
+def diameter_margin_fits_crop(row, crop_shape, series_data):
+    diameter = safe_float(row.get("median_max_diameter_mm"))
+    if diameter is None:
+        return "", ROI_CROP_MARGIN_MM, "", "", ""
+
+    required_radius_mm = diameter / 2.0 + ROI_CROP_MARGIN_MM
+
+    z_spacing = series_data.get("z_spacing")
+    y_spacing = series_data.get("y_spacing")
+    x_spacing = series_data.get("x_spacing")
+    spacings = (z_spacing, y_spacing, x_spacing)
+    if any(value is None for value in spacings):
+        return required_radius_mm, ROI_CROP_MARGIN_MM, "", "", ""
+
+    half_coverage = [
+        (float(size) - 1.0) * float(spacing) / 2.0
+        for size, spacing in zip(crop_shape, spacings)
+    ]
+    fits = all(value >= required_radius_mm for value in half_coverage)
+    return (
+        required_radius_mm,
+        ROI_CROP_MARGIN_MM,
+        min(half_coverage),
+        fits,
+        ";".join("{:.3f}".format(value) for value in half_coverage),
+    )
+
+
+def crop_roi_volume(row, series_data, np, crop_shape=(64, 64, 64), pad_value=-1000.0):
     volume = series_data["volume"]
     z_positions = series_data["z_positions"]
     depth, height, width = volume.shape
 
-    x_min = safe_float(row.get("x_min_px_roi"))
-    x_max = safe_float(row.get("x_max_px_roi"))
-    y_min = safe_float(row.get("y_min_px_roi"))
-    y_max = safe_float(row.get("y_max_px_roi"))
-    z_min = safe_float(row.get("z_min_mm_roi"))
-    z_max = safe_float(row.get("z_max_mm_roi"))
+    x_center = safe_float(row.get("x_center_px_consensus"))
+    y_center = safe_float(row.get("y_center_px_consensus"))
     z_center = safe_float(row.get("z_center_mm_consensus"))
 
-    if None in (x_min, x_max, y_min, y_max):
-        raise ValueError("Missing ROI x/y bounds")
+    if None in (x_center, y_center, z_center):
+        raise ValueError("Missing ROI centre coordinates")
+    if len(crop_shape) != 3 or min(crop_shape) <= 0:
+        raise ValueError("Invalid crop shape: {}".format(crop_shape))
 
-    x0 = clamp_int(math.floor(x_min), 0, width - 1)
-    x1 = clamp_int(math.ceil(x_max), 0, width - 1)
-    y0 = clamp_int(math.floor(y_min), 0, height - 1)
-    y1 = clamp_int(math.ceil(y_max), 0, height - 1)
-    if x1 <= x0 or y1 <= y0:
-        raise ValueError("Invalid ROI x/y bounds after clamping")
+    z_center_index = int(np.argmin(np.abs(z_positions - z_center)))
+    y_center_index = int(round(y_center))
+    x_center_index = int(round(x_center))
 
-    if z_min is not None and z_max is not None:
-        low = min(z_min, z_max)
-        high = max(z_min, z_max)
-        z_indices = np.where((z_positions >= low) & (z_positions <= high))[0]
-    else:
-        z_indices = np.array([], dtype=np.int64)
+    z_start, z_stop, z0, z1, dz0, dz1 = fixed_window(z_center_index, crop_shape[0], depth)
+    y_start, y_stop, y0, y1, dy0, dy1 = fixed_window(y_center_index, crop_shape[1], height)
+    x_start, x_stop, x0, x1, dx0, dx1 = fixed_window(x_center_index, crop_shape[2], width)
 
-    z_selection = "roi_z_range"
-    if z_indices.size == 0:
-        target = z_center if z_center is not None else float(np.median(z_positions))
-        nearest = int(np.argmin(np.abs(z_positions - target)))
-        z_indices = np.array([nearest], dtype=np.int64)
-        z_selection = "nearest_center_slice"
+    if z1 <= z0 or y1 <= y0 or x1 <= x0:
+        raise ValueError("ROI centre crop does not intersect the input volume")
 
-    z0 = int(z_indices.min())
-    z1 = int(z_indices.max())
-    crop = volume[z0:z1 + 1, y0:y1 + 1, x0:x1 + 1].astype(np.float32)
+    crop = np.full(tuple(crop_shape), float(pad_value), dtype=np.float32)
+    crop[dz0:dz1, dy0:dy1, dx0:dx1] = volume[z0:z1, y0:y1, x0:x1].astype(np.float32)
+
+    padded_voxels = int(crop.size - ((z1 - z0) * (y1 - y0) * (x1 - x0)))
+    required_radius_mm, crop_margin_mm, min_crop_radius_mm, diameter_fits, crop_half_extent_mm_zyx = diameter_margin_fits_crop(
+        row,
+        crop_shape,
+        series_data,
+    )
 
     return crop, {
         "input_depth": depth,
         "input_height": height,
         "input_width": width,
+        "crop_mode": "fixed_center_voxel_crop",
+        "crop_shape_zyx": "x".join(str(value) for value in crop_shape),
+        "roi_center_z_mm": z_center,
+        "roi_center_z_index": z_center_index,
+        "roi_center_y_px": y_center,
+        "roi_center_y_index": y_center_index,
+        "roi_center_x_px": x_center,
+        "roi_center_x_index": x_center_index,
+        "requested_crop_z0": z_start,
+        "requested_crop_z1_exclusive": z_stop,
+        "requested_crop_y0": y_start,
+        "requested_crop_y1_exclusive": y_stop,
+        "requested_crop_x0": x_start,
+        "requested_crop_x1_exclusive": x_stop,
         "crop_z0": z0,
-        "crop_z1": z1,
+        "crop_z1": z1 - 1,
         "crop_y0": y0,
-        "crop_y1": y1,
+        "crop_y1": y1 - 1,
         "crop_x0": x0,
-        "crop_x1": x1,
+        "crop_x1": x1 - 1,
         "crop_depth": crop.shape[0],
         "crop_height": crop.shape[1],
         "crop_width": crop.shape[2],
-        "z_selection": z_selection,
+        "padded_voxels": padded_voxels,
+        "pad_value_hu": pad_value,
+        "roi_crop_margin_mm": crop_margin_mm,
+        "diameter_plus_margin_radius_mm": required_radius_mm,
+        "minimum_crop_half_extent_mm": min_crop_radius_mm,
+        "diameter_margin_fits_crop": diameter_fits,
+        "crop_half_extent_mm_zyx": crop_half_extent_mm_zyx,
+        "z_selection": "nearest_manifest_center_slice",
     }
-
-
-def resize_axis(data, target_size, axis, np):
-    data = np.moveaxis(data, axis, 0)
-    old_size = data.shape[0]
-    if old_size == target_size:
-        return np.moveaxis(data, 0, axis)
-    if old_size == 1:
-        resized = np.repeat(data, target_size, axis=0)
-        return np.moveaxis(resized, 0, axis)
-
-    old_positions = np.linspace(0.0, old_size - 1.0, num=target_size)
-    left = np.floor(old_positions).astype(np.int64)
-    right = np.minimum(left + 1, old_size - 1)
-    weight = (old_positions - left).astype(np.float32)
-
-    flat = data.reshape(old_size, -1)
-    resized_flat = (1.0 - weight[:, None]) * flat[left] + weight[:, None] * flat[right]
-    resized = resized_flat.reshape((target_size,) + data.shape[1:])
-    return np.moveaxis(resized, 0, axis)
-
-
-def resize_volume(volume, target_shape, np):
-    resized = volume.astype(np.float32, copy=False)
-    for axis, target_size in enumerate(target_shape):
-        resized = resize_axis(resized, target_size, axis, np)
-    return resized.astype(np.float32, copy=False)
 
 
 def finite_stats(values, np):
@@ -365,6 +393,9 @@ def finite_stats(values, np):
 
 
 def preprocess_crop(crop, target_shape, hu_min, hu_max, np):
+    if tuple(crop.shape) != tuple(target_shape):
+        raise ValueError("Crop shape {} does not match target shape {}".format(crop.shape, target_shape))
+
     raw_stats = finite_stats(crop, np)
     nonfinite_count = raw_stats["nonfinite_count"]
     crop = np.nan_to_num(crop, nan=hu_min, posinf=hu_max, neginf=hu_min)
@@ -372,10 +403,9 @@ def preprocess_crop(crop, target_shape, hu_min, hu_max, np):
     clipped = np.clip(crop, hu_min, hu_max)
     clipped_voxels = int(np.sum((crop < hu_min) | (crop > hu_max)))
     normalised = (clipped - hu_min) / float(hu_max - hu_min)
-    resized = resize_volume(normalised, target_shape, np)
 
-    processed_stats = finite_stats(resized, np)
-    return resized.astype(np.float32, copy=False), raw_stats, processed_stats, {
+    processed_stats = finite_stats(normalised, np)
+    return normalised.astype(np.float32, copy=False), raw_stats, processed_stats, {
         "nonfinite_replaced_voxels": nonfinite_count,
         "hu_window_clipped_voxels": clipped_voxels,
         "hu_window_clipped_fraction": clipped_voxels / float(crop.size) if crop.size else "",
@@ -388,6 +418,16 @@ def volume_filename(row):
     safe = "{}__{}".format(patient, roi_id)
     safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in safe)
     return safe + ".npz"
+
+
+def existing_volume_matches_shape(volume_path, target_shape, np):
+    try:
+        with np.load(str(volume_path)) as npz:
+            if "volume" not in npz:
+                return False
+            return tuple(npz["volume"].shape) == tuple(target_shape)
+    except Exception:
+        return False
 
 
 def load_roi_rows(multiclass_split_path, binary_split_path, include_missing_labels=False):
@@ -438,14 +478,14 @@ def outlier_flags(row, crop_meta, raw_stats, handling):
     diameter = safe_float(row.get("median_max_diameter_mm"))
     if diameter is not None and diameter > 60.0:
         flags.append("diameter_gt_60mm")
+    if crop_meta.get("diameter_margin_fits_crop") is False:
+        flags.append("diameter_plus_2mm_margin_exceeds_crop")
     if safe_int(row.get("reader_count")) is not None and safe_int(row.get("reader_count")) < 3:
         flags.append("reader_count_lt_3")
     if clean_value(row.get("overall_consistency")) == "low":
         flags.append("low_annotation_consistency")
-    if crop_meta["crop_depth"] <= 1:
-        flags.append("single_slice_z_crop")
-    if crop_meta["crop_height"] <= 2 or crop_meta["crop_width"] <= 2:
-        flags.append("tiny_xy_crop")
+    if crop_meta.get("padded_voxels", 0):
+        flags.append("volume_padding_applied")
     if raw_stats["min"] != "" and raw_stats["min"] < -1200:
         flags.append("raw_hu_below_expected_range")
     if raw_stats["max"] != "" and raw_stats["max"] > 2000:
@@ -506,13 +546,20 @@ def extract_standardised_volumes(
             roi_id = clean_value(row.get("roi_id"))
             volume_path = Path(output_dir) / volume_filename(row)
             if volume_path.exists() and not force:
-                manifest_row = build_manifest_row(row, volume_path, target_shape, "reused_existing_file")
-                volume_manifest.append(manifest_row)
-                label_manifest.append(label_row_from_manifest(manifest_row))
-                continue
+                if existing_volume_matches_shape(volume_path, target_shape, np):
+                    manifest_row = build_manifest_row(row, volume_path, target_shape, "reused_existing_file")
+                    volume_manifest.append(manifest_row)
+                    label_manifest.append(label_row_from_manifest(manifest_row))
+                    continue
 
             try:
-                crop, crop_meta = crop_roi_volume(row, series_data, np)
+                crop, crop_meta = crop_roi_volume(
+                    row,
+                    series_data,
+                    np,
+                    crop_shape=target_shape,
+                    pad_value=hu_min,
+                )
                 standard_volume, raw_stats, processed_stats, handling = preprocess_crop(
                     crop,
                     target_shape=target_shape,
@@ -595,12 +642,32 @@ def build_qc_row(row, volume_path, target_shape, crop_meta, raw_stats, processed
         "reader_count": row.get("reader_count", ""),
         "overall_consistency": row.get("overall_consistency", ""),
         "median_max_diameter_mm": row.get("median_max_diameter_mm", ""),
+        "crop_mode": crop_meta["crop_mode"],
+        "roi_center_z_mm": crop_meta["roi_center_z_mm"],
+        "roi_center_z_index": crop_meta["roi_center_z_index"],
+        "roi_center_y_px": crop_meta["roi_center_y_px"],
+        "roi_center_y_index": crop_meta["roi_center_y_index"],
+        "roi_center_x_px": crop_meta["roi_center_x_px"],
+        "roi_center_x_index": crop_meta["roi_center_x_index"],
+        "requested_crop_z0": crop_meta["requested_crop_z0"],
+        "requested_crop_z1_exclusive": crop_meta["requested_crop_z1_exclusive"],
+        "requested_crop_y0": crop_meta["requested_crop_y0"],
+        "requested_crop_y1_exclusive": crop_meta["requested_crop_y1_exclusive"],
+        "requested_crop_x0": crop_meta["requested_crop_x0"],
+        "requested_crop_x1_exclusive": crop_meta["requested_crop_x1_exclusive"],
         "crop_depth_before": crop_meta["crop_depth"],
         "crop_height_before": crop_meta["crop_height"],
         "crop_width_before": crop_meta["crop_width"],
         "standard_depth_after": target_shape[0],
         "standard_height_after": target_shape[1],
         "standard_width_after": target_shape[2],
+        "padded_voxels": crop_meta["padded_voxels"],
+        "pad_value_hu": crop_meta["pad_value_hu"],
+        "roi_crop_margin_mm": crop_meta["roi_crop_margin_mm"],
+        "diameter_plus_margin_radius_mm": crop_meta["diameter_plus_margin_radius_mm"],
+        "minimum_crop_half_extent_mm": crop_meta["minimum_crop_half_extent_mm"],
+        "diameter_margin_fits_crop": crop_meta["diameter_margin_fits_crop"],
+        "crop_half_extent_mm_zyx": crop_meta["crop_half_extent_mm_zyx"],
         "z_selection": crop_meta["z_selection"],
         "raw_hu_min_before": raw_stats["min"],
         "raw_hu_max_before": raw_stats["max"],
@@ -627,7 +694,7 @@ def outlier_row(row, volume_path, flags, handling):
         "SeriesInstanceUID": row.get("SeriesInstanceUID", ""),
         "outlier_status": "handled",
         "outlier_flags": ";".join(flags),
-        "handling": "ROI bounds clamped; HU values clipped to window; volume resized to fixed shape.",
+        "handling": "Fixed centre crop was clipped/padded at scan boundaries if needed; HU values clipped to window.",
         "nonfinite_replaced_voxels": handling.get("nonfinite_replaced_voxels", ""),
         "hu_window_clipped_fraction": handling.get("hu_window_clipped_fraction", ""),
     }
@@ -654,7 +721,11 @@ def write_criteria(target_shape, hu_min, hu_max, include_missing_labels):
         },
         {
             "criterion": "ROI volume extraction",
-            "definition": "Crops the process3 consensus x/y ROI box and z ROI range from the raw DICOM CT series.",
+            "definition": "Crops a fixed voxel-coordinate cube around the manifest consensus nodule centre coordinates.",
+        },
+        {
+            "criterion": "Recommended nodule coverage",
+            "definition": "The default 64x64x64 crop is checked against the manifest median maximum diameter plus a {} mm margin.".format(ROI_CROP_MARGIN_MM),
         },
         {
             "criterion": "HU conversion",
@@ -666,7 +737,7 @@ def write_criteria(target_shape, hu_min, hu_max, include_missing_labels):
         },
         {
             "criterion": "Shape standardisation",
-            "definition": "Each ROI is resized to fixed z/y/x shape {}.".format("x".join(str(v) for v in target_shape)),
+            "definition": "Each ROI is exported directly as fixed z/y/x crop shape {}.".format("x".join(str(v) for v in target_shape)),
         },
         {
             "criterion": "Label file",
@@ -727,7 +798,7 @@ def parse_args(argv=None):
     parser.add_argument("--binary-split", type=Path, default=BINARY_SPLIT_TABLE, help="Process4 binary split manifest.")
     parser.add_argument("--lidc-root", type=Path, default=LIDC_ROOT, help="Root containing raw LIDC data.")
     parser.add_argument("--output-dir", type=Path, default=VOLUME_DIR, help="Directory for compressed 3D ROI volumes.")
-    parser.add_argument("--shape", default="32,64,64", help="Standard output volume shape as z,y,x.")
+    parser.add_argument("--shape", default="64,64,64", help="Fixed voxel crop shape as z,y,x.")
     parser.add_argument("--hu-min", type=float, default=-1000.0, help="Lower HU window bound.")
     parser.add_argument("--hu-max", type=float, default=400.0, help="Upper HU window bound.")
     parser.add_argument("--max-rois", type=int, default=None, help="Optional debug limit.")

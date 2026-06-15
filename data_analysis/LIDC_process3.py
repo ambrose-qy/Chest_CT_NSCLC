@@ -345,6 +345,8 @@ def build_consensus_roi(cluster_id, consistency_row, reader_rows, margin_mm, min
         "image_ap_position": first.get("image_ap_position", ""),
         "z_location_tertile": first.get("z_location_tertile", ""),
         "majority_malignancy": consistency_row.get("majority_malignancy", ""),
+        "majority_internal_structure": consistency_row.get("majority_internal_structure", ""),
+        "majority_calcification": consistency_row.get("majority_calcification", ""),
         "majority_sphericity": consistency_row.get("majority_sphericity", ""),
         "majority_margin": consistency_row.get("majority_margin", ""),
         "majority_lobulation": consistency_row.get("majority_lobulation", ""),

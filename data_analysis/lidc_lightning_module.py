@@ -32,6 +32,8 @@ class LIDCClassifier(pl.LightningModule):
         max_epochs=50,
         dropout=0.2,
         gradient_clip_val=0.0,
+        attention="none",
+        fusion="none",
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -42,6 +44,8 @@ class LIDCClassifier(pl.LightningModule):
             pretrained=pretrained,
             in_channels=in_channels,
             dropout=dropout,
+            attention=attention,
+            fusion=fusion,
         )
         if class_weights is not None:
             class_weights = torch.tensor(class_weights, dtype=torch.float32)

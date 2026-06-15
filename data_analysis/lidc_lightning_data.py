@@ -20,6 +20,18 @@ HU_MIN = -1000.0
 HU_MAX = 400.0
 BINARY_LABELS = ["benign", "malignant"]
 MULTICLASS_LABELS = ["low_risk", "intermediate_risk", "high_risk"]
+METADATA_COLUMNS = [
+    "median_max_diameter_mm",
+    "majority_calcification",
+    "majority_internal_structure",
+    "majority_sphericity",
+    "majority_margin",
+    "majority_lobulation",
+    "majority_spiculation",
+    "majority_texture",
+    "overall_consistency",
+    "label_confidence",
+]
 
 
 try:
@@ -118,6 +130,10 @@ def normalise_tensor(tensor, mean=None, std=None):
     return (tensor - mean_tensor) / torch.clamp(std_tensor, min=1e-6)
 
 
+def metadata_from_row(row):
+    return {key: clean_value(row.get(key)) for key in METADATA_COLUMNS}
+
+
 def random_cutout_2d(tensor, fraction):
     if not fraction or fraction <= 0:
         return tensor
@@ -151,6 +167,7 @@ def augment_2d(
     rotate=True,
     flip=True,
     scale=True,
+    scale_range=0.10,
     noise_std=0.02,
     intensity_shift=0.05,
     contrast_range=0.10,
@@ -164,7 +181,8 @@ def augment_2d(
         tensor = torch.rot90(tensor, k=random.choice([1, 2, 3]), dims=(1, 2))
     if scale:
         original = tensor.shape[-2:]
-        factor = random.uniform(0.9, 1.1)
+        scale_range = max(float(scale_range), 0.0)
+        factor = random.uniform(1.0 - scale_range, 1.0 + scale_range)
         scaled = [max(4, int(round(value * factor))) for value in original]
         tensor = F.interpolate(tensor.unsqueeze(0), size=scaled, mode="bilinear", align_corners=False).squeeze(0)
         tensor = center_crop_or_pad_2d(tensor, original)
@@ -187,6 +205,7 @@ def augment_3d(
     rotate=True,
     flip=True,
     scale=True,
+    scale_range=0.10,
     noise_std=0.02,
     intensity_shift=0.05,
     contrast_range=0.10,
@@ -202,7 +221,8 @@ def augment_3d(
         tensor = torch.rot90(tensor, k=random.choice([1, 2, 3]), dims=(2, 3))
     if scale:
         original = tensor.shape[-3:]
-        factor = random.uniform(0.9, 1.1)
+        scale_range = max(float(scale_range), 0.0)
+        factor = random.uniform(1.0 - scale_range, 1.0 + scale_range)
         scaled = [max(4, int(round(value * factor))) for value in original]
         tensor = F.interpolate(tensor.unsqueeze(0), size=scaled, mode="trilinear", align_corners=False).squeeze(0)
         tensor = center_crop_or_pad_3d(tensor, original)
@@ -235,6 +255,7 @@ class LIDC2DMaxSliceDataset(Dataset):
         augment_rotate=True,
         augment_flip=True,
         augment_scale=True,
+        augment_scale_range=0.10,
         augment_noise_std=0.02,
         augment_intensity_shift=0.05,
         augment_contrast_range=0.10,
@@ -251,6 +272,7 @@ class LIDC2DMaxSliceDataset(Dataset):
         self.augment_rotate = augment_rotate
         self.augment_flip = augment_flip
         self.augment_scale = augment_scale
+        self.augment_scale_range = augment_scale_range
         self.augment_noise_std = augment_noise_std
         self.augment_intensity_shift = augment_intensity_shift
         self.augment_contrast_range = augment_contrast_range
@@ -299,6 +321,7 @@ class LIDC2DMaxSliceDataset(Dataset):
                 rotate=as_bool(self.augment_rotate),
                 flip=as_bool(self.augment_flip),
                 scale=as_bool(self.augment_scale),
+                scale_range=float(self.augment_scale_range),
                 noise_std=float(self.augment_noise_std),
                 intensity_shift=float(self.augment_intensity_shift),
                 contrast_range=float(self.augment_contrast_range),
@@ -312,6 +335,7 @@ class LIDC2DMaxSliceDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.long),
             "roi_id": row.get("roi_id", ""),
             "patient_id": row.get("PatientID") or row.get("patient_folder", ""),
+            "metadata": metadata_from_row(row),
         }
 
 
@@ -328,6 +352,7 @@ class LIDC3DVolumeDataset(Dataset):
         augment_rotate=True,
         augment_flip=True,
         augment_scale=True,
+        augment_scale_range=0.10,
         augment_noise_std=0.02,
         augment_intensity_shift=0.05,
         augment_contrast_range=0.10,
@@ -342,6 +367,7 @@ class LIDC3DVolumeDataset(Dataset):
         self.augment_rotate = augment_rotate
         self.augment_flip = augment_flip
         self.augment_scale = augment_scale
+        self.augment_scale_range = augment_scale_range
         self.augment_noise_std = augment_noise_std
         self.augment_intensity_shift = augment_intensity_shift
         self.augment_contrast_range = augment_contrast_range
@@ -381,6 +407,7 @@ class LIDC3DVolumeDataset(Dataset):
                 rotate=as_bool(self.augment_rotate),
                 flip=as_bool(self.augment_flip),
                 scale=as_bool(self.augment_scale),
+                scale_range=float(self.augment_scale_range),
                 noise_std=float(self.augment_noise_std),
                 intensity_shift=float(self.augment_intensity_shift),
                 contrast_range=float(self.augment_contrast_range),
@@ -394,6 +421,7 @@ class LIDC3DVolumeDataset(Dataset):
             "label": torch.tensor(label, dtype=torch.long),
             "roi_id": row.get("roi_id", ""),
             "patient_id": row.get("PatientID") or row.get("patient_folder", ""),
+            "metadata": metadata_from_row(row),
         }
 
 
@@ -414,6 +442,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         augment_rotate=True,
         augment_flip=True,
         augment_scale=True,
+        augment_scale_range=0.10,
         augment_noise_std=0.02,
         augment_intensity_shift=0.05,
         augment_contrast_range=0.10,
@@ -434,6 +463,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         self.augment_rotate = augment_rotate
         self.augment_flip = augment_flip
         self.augment_scale = augment_scale
+        self.augment_scale_range = augment_scale_range
         self.augment_noise_std = augment_noise_std
         self.augment_intensity_shift = augment_intensity_shift
         self.augment_contrast_range = augment_contrast_range
@@ -461,6 +491,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             augment_rotate=self.augment_rotate,
             augment_flip=self.augment_flip,
             augment_scale=self.augment_scale,
+            augment_scale_range=self.augment_scale_range,
             augment_noise_std=self.augment_noise_std,
             augment_intensity_shift=self.augment_intensity_shift,
             augment_contrast_range=self.augment_contrast_range,
