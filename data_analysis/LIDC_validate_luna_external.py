@@ -21,6 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from lidc_lightning_data import BINARY_LABELS, MULTICLASS_LABELS, normalise_tensor
+from lidc_lightning_train_utils import trusted_local_checkpoint_load
 from lidc_lightning_utils import EXPERIMENT_DIR, import_lightning, write_csv, write_json
 
 
@@ -254,7 +255,8 @@ def evaluate_one(config_path, manifest_path, output_dir, checkpoint_path=None, b
     load_kwargs = {}
     if config.get("class_weights") is not None:
         load_kwargs["class_weights"] = config.get("class_weights")
-    model = LIDCClassifier.load_from_checkpoint(str(checkpoint), map_location=device, **load_kwargs)
+    with trusted_local_checkpoint_load():
+        model = LIDCClassifier.load_from_checkpoint(str(checkpoint), map_location=device, **load_kwargs)
     model.to(device)
 
     base_rows, probabilities = predict(model, loader, device)

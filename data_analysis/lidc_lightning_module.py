@@ -71,6 +71,8 @@ class LIDCClassifier(pl.LightningModule):
         accuracy = (predictions == labels).float().mean()
 
         batch_size = labels.size(0)
+        if stage == "train":
+            self._last_train_batch_size = int(batch_size)
         self.log("{}_loss".format(stage), loss, on_step=stage == "train", on_epoch=True, prog_bar=True, batch_size=batch_size)
         if stage == "train":
             self.log("train_accuracy_step", accuracy, on_step=True, on_epoch=False, prog_bar=False, batch_size=batch_size)
@@ -93,11 +95,12 @@ class LIDCClassifier(pl.LightningModule):
 
     def on_train_epoch_start(self):
         self._epoch_outputs["train"] = []
+        self._last_train_batch_size = 1
         if not self._logged_static_hparams:
-            self.log("hparam_dropout", float(self.hparams.dropout), on_epoch=True, prog_bar=False)
-            self.log("hparam_gradient_clip_val", float(self.hparams.gradient_clip_val), on_epoch=True, prog_bar=False)
-            self.log("hparam_learning_rate", float(self.hparams.lr), on_epoch=True, prog_bar=False)
-            self.log("hparam_weight_decay", float(self.hparams.weight_decay), on_epoch=True, prog_bar=False)
+            self.log("hparam_dropout", float(self.hparams.dropout), on_epoch=True, prog_bar=False, batch_size=1)
+            self.log("hparam_gradient_clip_val", float(self.hparams.gradient_clip_val), on_epoch=True, prog_bar=False, batch_size=1)
+            self.log("hparam_learning_rate", float(self.hparams.lr), on_epoch=True, prog_bar=False, batch_size=1)
+            self.log("hparam_weight_decay", float(self.hparams.weight_decay), on_epoch=True, prog_bar=False, batch_size=1)
             self._logged_static_hparams = True
 
     def on_validation_epoch_start(self):
@@ -174,10 +177,11 @@ class LIDCClassifier(pl.LightningModule):
         avg_abs_grad = grad_abs_sum / float(max(grad_count, 1))
         grad_norm_l2 = grad_sq_sum ** 0.5
         param_norm_l2 = param_sq_sum ** 0.5
-        self.log("train_avg_abs_gradient", avg_abs_grad, on_step=True, on_epoch=True, prog_bar=False)
-        self.log("train_gradient_l2_norm", grad_norm_l2, on_step=True, on_epoch=True, prog_bar=False)
-        self.log("train_max_abs_gradient", grad_max, on_step=True, on_epoch=True, prog_bar=False)
-        self.log("train_parameter_l2_norm", param_norm_l2, on_step=True, on_epoch=True, prog_bar=False)
+        batch_size = int(getattr(self, "_last_train_batch_size", 1))
+        self.log("train_avg_abs_gradient", avg_abs_grad, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        self.log("train_gradient_l2_norm", grad_norm_l2, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        self.log("train_max_abs_gradient", grad_max, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
+        self.log("train_parameter_l2_norm", param_norm_l2, on_step=True, on_epoch=True, prog_bar=False, batch_size=batch_size)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(

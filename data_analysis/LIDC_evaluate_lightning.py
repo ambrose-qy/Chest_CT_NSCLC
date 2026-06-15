@@ -28,6 +28,7 @@ from lidc_lightning_utils import (
     write_csv,
     write_json,
 )
+from lidc_lightning_train_utils import trusted_local_checkpoint_load
 
 
 DEFAULT_REPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "processed" / "model_reports" / "lidc_lightning"
@@ -155,7 +156,8 @@ def main(argv=None):
     load_kwargs = {}
     if config.get("class_weights") is not None:
         load_kwargs["class_weights"] = config.get("class_weights")
-    model = LIDCClassifier.load_from_checkpoint(str(args.checkpoint), map_location=device, **load_kwargs)
+    with trusted_local_checkpoint_load():
+        model = LIDCClassifier.load_from_checkpoint(str(args.checkpoint), map_location=device, **load_kwargs)
     model.to(device)
     labels, probabilities, roi_ids, patient_ids = predict(model, data_module.test_dataloader(), device)
 

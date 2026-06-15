@@ -4,8 +4,10 @@ Shared training helpers for LIDC-IDRI Lightning scripts.
 
 from __future__ import print_function
 
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+import warnings
 
 import numpy as np
 
@@ -23,6 +25,21 @@ from lidc_lightning_models import count_parameters
 
 
 FIXED_MULTICLASS_CLASS_WEIGHTS = [1.5, 0.5, 1.8]
+CHECKPOINT_MONITORS = {
+    "auc_roc": "val_auc_roc",
+    "f1": "val_f1",
+}
+
+
+@contextmanager
+def trusted_local_checkpoint_load():
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            "ignore",
+            message=".*torch.load.*weights_only=False.*",
+            category=FutureWarning,
+        )
+        yield
 
 
 def class_weights_from_counts(counts, num_classes):
@@ -71,6 +88,109 @@ def serialise_args(args):
     for key, value in vars(args).items():
         result[key] = str(value) if isinstance(value, Path) else value
     return result
+
+
+def score_to_float(score):
+    if score is None:
+        return None
+    try:
+        return float(score.detach().cpu())
+    except AttributeError:
+        return float(score)
+
+
+def checkpoint_summary(callback, monitor):
+    return {
+        "monitor_metric": monitor,
+        "best_checkpoint": getattr(callback, "best_model_path", ""),
+        "best_score": score_to_float(getattr(callback, "best_model_score", None)),
+    }
+
+
+def checkpoint_tag_for_monitor(monitor):
+    for tag, metric in CHECKPOINT_MONITORS.items():
+        if monitor == metric:
+            return tag
+    return "auc_roc"
+
+
+def make_metric_guard_callback(pl, args):
+    if not bool(getattr(args, "metric_guard_enabled", True)):
+        return None
+
+    class MetricGuardCallback(pl.Callback):
+        def __init__(self):
+            super().__init__()
+            self.warmup_epochs = int(getattr(args, "metric_guard_warmup_epochs", 3))
+            self.patience = max(int(getattr(args, "metric_guard_patience", 2)), 1)
+            self.min_val_auc_roc = float(getattr(args, "metric_guard_min_val_auc_roc", 0.50))
+            self.min_val_f1 = float(getattr(args, "metric_guard_min_val_f1", 0.10))
+            self.min_val_accuracy = float(getattr(args, "metric_guard_min_val_accuracy", 0.0))
+            self.max_val_loss = float(getattr(args, "metric_guard_max_val_loss", 5.0))
+            self.bad_counts = {}
+            self.stop_reason = ""
+
+        @staticmethod
+        def metric_float(trainer, name):
+            value = trainer.callback_metrics.get(name)
+            if value is None:
+                return None
+            try:
+                return float(value.detach().cpu())
+            except AttributeError:
+                return float(value)
+
+        @staticmethod
+        def is_finite(value):
+            return value is None or np.isfinite(value)
+
+        def enabled_threshold(self, value):
+            return value is not None and value > 0.0
+
+        def on_validation_epoch_end(self, trainer, pl_module):
+            if getattr(trainer, "sanity_checking", False):
+                return
+
+            epoch_number = int(trainer.current_epoch) + 1
+            metrics = {
+                "val_auc_roc": self.metric_float(trainer, "val_auc_roc"),
+                "val_f1": self.metric_float(trainer, "val_f1"),
+                "val_accuracy": self.metric_float(trainer, "val_accuracy"),
+                "val_loss": self.metric_float(trainer, "val_loss"),
+            }
+
+            reasons = []
+            for name, value in metrics.items():
+                if not self.is_finite(value):
+                    reasons.append("{}_non_finite".format(name))
+
+            if epoch_number > self.warmup_epochs:
+                if self.enabled_threshold(self.min_val_auc_roc) and metrics["val_auc_roc"] is not None:
+                    if metrics["val_auc_roc"] < self.min_val_auc_roc:
+                        reasons.append("val_auc_roc_below_{:.3f}".format(self.min_val_auc_roc))
+                if self.enabled_threshold(self.min_val_f1) and metrics["val_f1"] is not None:
+                    if metrics["val_f1"] < self.min_val_f1:
+                        reasons.append("val_f1_below_{:.3f}".format(self.min_val_f1))
+                if self.enabled_threshold(self.min_val_accuracy) and metrics["val_accuracy"] is not None:
+                    if metrics["val_accuracy"] < self.min_val_accuracy:
+                        reasons.append("val_accuracy_below_{:.3f}".format(self.min_val_accuracy))
+                if self.enabled_threshold(self.max_val_loss) and metrics["val_loss"] is not None:
+                    if metrics["val_loss"] > self.max_val_loss:
+                        reasons.append("val_loss_above_{:.3f}".format(self.max_val_loss))
+
+            active_reasons = set(reasons)
+            for reason in list(self.bad_counts.keys()):
+                if reason not in active_reasons:
+                    self.bad_counts[reason] = 0
+            for reason in active_reasons:
+                self.bad_counts[reason] = self.bad_counts.get(reason, 0) + 1
+                if self.bad_counts[reason] >= self.patience:
+                    self.stop_reason = "{} for {} validation epochs".format(reason, self.bad_counts[reason])
+                    log("Metric guard stopping training: {}".format(self.stop_reason))
+                    trainer.should_stop = True
+                    break
+
+    return MetricGuardCallback()
 
 
 def build_confusion_matrix(labels, probabilities, class_names):
@@ -149,6 +269,44 @@ def write_test_confusion_matrix(output_dir, model, task):
     return payload
 
 
+def evaluate_checkpoint(
+    trainer,
+    model,
+    data_module,
+    output_dir,
+    task,
+    checkpoint_path,
+    tag,
+    write_legacy=False,
+    metrics_filename=None,
+    confusion_subdir=None,
+):
+    if not checkpoint_path:
+        return {}
+
+    with trusted_local_checkpoint_load():
+        test_results = trainer.test(model, datamodule=data_module, ckpt_path=str(checkpoint_path))
+    metrics = test_results[0] if test_results else {}
+
+    output_dir = Path(output_dir)
+    metrics_path = output_dir / (metrics_filename or "test_metrics_best_{}.json".format(tag))
+    write_json(metrics_path, metrics)
+
+    if write_legacy:
+        write_json(output_dir / "test_metrics.json", metrics)
+        confusion_payload = write_test_confusion_matrix(output_dir, model, task)
+    else:
+        subdir = confusion_subdir or "best_{}_test".format(tag)
+        confusion_payload = write_test_confusion_matrix(output_dir / subdir, model, task)
+
+    return {
+        "checkpoint": str(checkpoint_path),
+        "test_metrics": metrics,
+        "test_metrics_path": str(metrics_path),
+        "test_confusion_matrix": confusion_payload,
+    }
+
+
 def run_lightning_training(args, input_dim, manifest_path):
     pl = import_lightning()
     from lidc_grad_cam import generate_grad_cam_visualizations
@@ -207,23 +365,37 @@ def run_lightning_training(args, input_dim, manifest_path):
     output_dir = Path(args.output_dir) / run_name
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    callbacks = [
-        pl.callbacks.ModelCheckpoint(
+    checkpoint_callbacks = {
+        "auc_roc": pl.callbacks.ModelCheckpoint(
             dirpath=str(output_dir / "checkpoints"),
-            filename="best-{epoch:03d}-{%s:.4f}" % monitor_metric,
-            monitor=monitor_metric,
-            mode=mode,
+            filename="best_auc_roc-{epoch:03d}-{val_auc_roc:.4f}",
+            monitor="val_auc_roc",
+            mode="max",
             save_top_k=1,
             save_last=True,
         ),
+        "f1": pl.callbacks.ModelCheckpoint(
+            dirpath=str(output_dir / "checkpoints"),
+            filename="best_f1-{epoch:03d}-{val_f1:.4f}",
+            monitor="val_f1",
+            mode="max",
+            save_top_k=1,
+        ),
+    }
+    metric_guard_callback = make_metric_guard_callback(pl, args)
+    callbacks = [
+        checkpoint_callbacks["auc_roc"],
+        checkpoint_callbacks["f1"],
         pl.callbacks.EarlyStopping(
             monitor=monitor_metric,
             mode=mode,
             patience=args.early_stop_patience,
             min_delta=args.early_stop_min_delta,
         ),
-        pl.callbacks.LearningRateMonitor(logging_interval="epoch"),
     ]
+    if metric_guard_callback is not None:
+        callbacks.append(metric_guard_callback)
+    callbacks.append(pl.callbacks.LearningRateMonitor(logging_interval="epoch"))
 
     csv_logger = pl.loggers.CSVLogger(save_dir=str(output_dir), name="logs")
     trainer = pl.Trainer(
@@ -272,6 +444,17 @@ def run_lightning_training(args, input_dim, manifest_path):
         "fusion": getattr(args, "fusion", "none"),
         "parameter_count": count_parameters(model.model),
         "monitor_metric": monitor_metric,
+        "checkpoint_monitors": CHECKPOINT_MONITORS,
+        "primary_checkpoint_tag": checkpoint_tag_for_monitor(monitor_metric),
+        "metric_guard": {
+            "enabled": bool(getattr(args, "metric_guard_enabled", True)),
+            "warmup_epochs": int(getattr(args, "metric_guard_warmup_epochs", 3)),
+            "patience": int(getattr(args, "metric_guard_patience", 2)),
+            "min_val_auc_roc": float(getattr(args, "metric_guard_min_val_auc_roc", 0.50)),
+            "min_val_f1": float(getattr(args, "metric_guard_min_val_f1", 0.10)),
+            "min_val_accuracy": float(getattr(args, "metric_guard_min_val_accuracy", 0.0)),
+            "max_val_loss": float(getattr(args, "metric_guard_max_val_loss", 5.0)),
+        },
     }
     write_json(output_dir / "config.json", config)
     write_json(output_dir / "hparams.json", serialise_args(args))
@@ -285,16 +468,54 @@ def run_lightning_training(args, input_dim, manifest_path):
     log("Trainable parameters: {}".format(config["parameter_count"]))
 
     trainer.fit(model, datamodule=data_module)
-    test_results = trainer.test(model, datamodule=data_module, ckpt_path="best")
-    write_json(output_dir / "test_metrics.json", test_results[0] if test_results else {})
-    confusion_payload = write_test_confusion_matrix(output_dir, model, args.task)
 
-    best_path = callbacks[0].best_model_path
-    best_score = callbacks[0].best_model_score
+    final_checkpoint_path = output_dir / "checkpoints" / "final.ckpt"
+    final_checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+    trainer.save_checkpoint(str(final_checkpoint_path))
+
+    checkpoint_payloads = {
+        tag: checkpoint_summary(callback, CHECKPOINT_MONITORS[tag])
+        for tag, callback in checkpoint_callbacks.items()
+    }
+    primary_tag = checkpoint_tag_for_monitor(monitor_metric)
+    evaluation_order = [primary_tag] + [tag for tag in CHECKPOINT_MONITORS if tag != primary_tag]
+    checkpoint_evaluations = {}
+    for tag in evaluation_order:
+        checkpoint_path = checkpoint_payloads[tag].get("best_checkpoint", "")
+        checkpoint_evaluations[tag] = evaluate_checkpoint(
+            trainer,
+            model,
+            data_module,
+            output_dir,
+            args.task,
+            checkpoint_path,
+            tag,
+            write_legacy=tag == primary_tag,
+        )
+    final_evaluation = evaluate_checkpoint(
+        trainer,
+        model,
+        data_module,
+        output_dir,
+        args.task,
+        final_checkpoint_path,
+        "final",
+        write_legacy=False,
+        metrics_filename="test_metrics_final.json",
+        confusion_subdir="final_test",
+    )
+
+    primary_checkpoint = checkpoint_payloads.get(primary_tag, {})
+    primary_evaluation = checkpoint_evaluations.get(primary_tag, {})
+    best_path = primary_checkpoint.get("best_checkpoint", "")
+    best_score = primary_checkpoint.get("best_score")
+    confusion_payload = primary_evaluation.get("test_confusion_matrix", {})
+    primary_test_metrics = primary_evaluation.get("test_metrics", {})
     grad_cam_payload = {}
     if bool(getattr(args, "enable_grad_cam", True)) and best_path:
         class_names = BINARY_LABELS if args.task == "binary" else MULTICLASS_LABELS
-        cam_model = LIDCClassifier.load_from_checkpoint(str(best_path), map_location="cpu")
+        with trusted_local_checkpoint_load():
+            cam_model = LIDCClassifier.load_from_checkpoint(str(best_path), map_location="cpu")
         grad_cam_payload = generate_grad_cam_visualizations(
             cam_model,
             data_module,
@@ -307,9 +528,16 @@ def run_lightning_training(args, input_dim, manifest_path):
     best_payload = {
         "run_name": run_name,
         "best_checkpoint": best_path,
-        "best_score": None if best_score is None else float(best_score.detach().cpu()),
+        "best_score": best_score,
         "monitor_metric": monitor_metric,
-        "test_metrics": test_results[0] if test_results else {},
+        "primary_checkpoint_tag": primary_tag,
+        "checkpoint_monitors": CHECKPOINT_MONITORS,
+        "checkpoints": checkpoint_payloads,
+        "checkpoint_evaluations": checkpoint_evaluations,
+        "final_checkpoint": str(final_checkpoint_path),
+        "final_evaluation": final_evaluation,
+        "metric_guard_stop_reason": getattr(metric_guard_callback, "stop_reason", "") if metric_guard_callback is not None else "",
+        "test_metrics": primary_test_metrics,
         "test_confusion_matrix": confusion_payload,
         "grad_cam": grad_cam_payload,
         "config_path": str(output_dir / "config.json"),
@@ -318,6 +546,8 @@ def run_lightning_training(args, input_dim, manifest_path):
     write_json(output_dir / "best_config.json", best_payload)
     log("Best checkpoint: {}".format(best_path))
     log("Best {}: {}".format(monitor_metric, best_payload["best_score"]))
+    for tag, payload in checkpoint_payloads.items():
+        log("Best {} checkpoint: {} ({})".format(tag, payload.get("best_checkpoint", ""), payload.get("best_score")))
     if confusion_payload:
         log("Test confusion matrix: {}".format(confusion_payload.get("confusion_matrix_csv")))
     if grad_cam_payload:
@@ -337,6 +567,13 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--monitor", default="val_auc_roc", help="Early-stopping/checkpoint monitor metric.")
     parser.add_argument("--early-stop-patience", type=int, default=8)
     parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
+    parser.add_argument("--metric-guard-enabled", type=int, default=1, help="Stop early when validation metrics are clearly invalid or too poor.")
+    parser.add_argument("--metric-guard-warmup-epochs", type=int, default=3, help="Epochs to ignore before threshold-based metric guard checks.")
+    parser.add_argument("--metric-guard-patience", type=int, default=2, help="Consecutive bad validation epochs before metric guard stops.")
+    parser.add_argument("--metric-guard-min-val-auc-roc", type=float, default=0.50, help="Stop if validation AUROC stays below this after warmup. Use 0 to disable.")
+    parser.add_argument("--metric-guard-min-val-f1", type=float, default=0.10, help="Stop if validation F1 stays below this after warmup. Use 0 to disable.")
+    parser.add_argument("--metric-guard-min-val-accuracy", type=float, default=0.0, help="Stop if validation accuracy stays below this after warmup. Use 0 to disable.")
+    parser.add_argument("--metric-guard-max-val-loss", type=float, default=5.0, help="Stop if validation loss stays above this after warmup. Use 0 to disable.")
     parser.add_argument("--num-workers", type=int, default=0, help="Keep 0 on Windows unless multiprocessing is configured.")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--precision", default="32-true", help="Lightning precision setting, e.g. 32-true or 16-mixed.")
