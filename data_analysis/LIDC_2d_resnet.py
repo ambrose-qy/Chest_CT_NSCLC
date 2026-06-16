@@ -38,6 +38,7 @@ HYPERPARAMETERS = {
     "num_workers": 0,
     "seed": 42,
     "precision": "32-true",
+    "matmul_precision": "medium",
     "pretrained": False,
     "normalization_mean": "auto",
     "normalization_std": "auto",

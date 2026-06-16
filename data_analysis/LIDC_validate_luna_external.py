@@ -21,7 +21,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from lidc_lightning_data import BINARY_LABELS, MULTICLASS_LABELS, normalise_tensor
-from lidc_lightning_train_utils import trusted_local_checkpoint_load
+from lidc_lightning_train_utils import configure_torch_matmul_precision, trusted_local_checkpoint_load
 from lidc_lightning_utils import EXPERIMENT_DIR, import_lightning, write_csv, write_json
 
 
@@ -224,6 +224,7 @@ def load_checkpoint_from_config(config_path, checkpoint_path=None):
 
 def evaluate_one(config_path, manifest_path, output_dir, checkpoint_path=None, batch_size=None, max_samples=None, num_workers=0):
     import_lightning()
+    configure_torch_matmul_precision("medium")
     from lidc_lightning_module import LIDCClassifier
 
     config = read_json(config_path)

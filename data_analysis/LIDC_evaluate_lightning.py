@@ -28,7 +28,7 @@ from lidc_lightning_utils import (
     write_csv,
     write_json,
 )
-from lidc_lightning_train_utils import trusted_local_checkpoint_load
+from lidc_lightning_train_utils import configure_torch_matmul_precision, trusted_local_checkpoint_load
 
 
 DEFAULT_REPORT_DIR = Path(__file__).resolve().parents[1] / "data" / "processed" / "model_reports" / "lidc_lightning"
@@ -123,6 +123,7 @@ def maybe_write_figures(output_dir, labels, probabilities, class_names, task):
 def main(argv=None):
     args = parse_args(argv)
     import_lightning()
+    configure_torch_matmul_precision("medium")
     from lidc_grad_cam import generate_grad_cam_visualizations
     from lidc_lightning_module import LIDCClassifier
 

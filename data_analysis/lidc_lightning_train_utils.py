@@ -10,6 +10,7 @@ from pathlib import Path
 import warnings
 
 import numpy as np
+import torch
 
 from lidc_lightning_data import BINARY_LABELS, LIDCDataModule, MULTICLASS_LABELS
 from lidc_lightning_utils import (
@@ -40,6 +41,15 @@ def trusted_local_checkpoint_load():
             category=FutureWarning,
         )
         yield
+
+
+def configure_torch_matmul_precision(value="medium"):
+    if not torch.cuda.is_available():
+        return None
+    if not hasattr(torch, "set_float32_matmul_precision"):
+        return None
+    torch.set_float32_matmul_precision(value)
+    return value
 
 
 def class_weights_from_counts(counts, num_classes):
@@ -312,6 +322,7 @@ def run_lightning_training(args, input_dim, manifest_path):
     from lidc_grad_cam import generate_grad_cam_visualizations
     from lidc_lightning_module import LIDCClassifier
     set_seed(args.seed)
+    matmul_precision = configure_torch_matmul_precision(getattr(args, "matmul_precision", "medium"))
 
     num_classes = 2 if args.task == "binary" else 3
     monitor_metric = args.monitor
@@ -443,6 +454,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         "attention": getattr(args, "attention", "none"),
         "fusion": getattr(args, "fusion", "none"),
         "parameter_count": count_parameters(model.model),
+        "matmul_precision": matmul_precision,
         "monitor_metric": monitor_metric,
         "checkpoint_monitors": CHECKPOINT_MONITORS,
         "primary_checkpoint_tag": checkpoint_tag_for_monitor(monitor_metric),
@@ -466,6 +478,8 @@ def run_lightning_training(args, input_dim, manifest_path):
     log("Task: {} using split column '{}'".format(args.task, config["split_column"]))
     log("Normalization stats: {}".format(data_module.normalization_stats))
     log("Trainable parameters: {}".format(config["parameter_count"]))
+    if matmul_precision:
+        log("Torch float32 matmul precision: {}".format(matmul_precision))
 
     trainer.fit(model, datamodule=data_module)
 
@@ -577,6 +591,7 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--num-workers", type=int, default=0, help="Keep 0 on Windows unless multiprocessing is configured.")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--precision", default="32-true", help="Lightning precision setting, e.g. 32-true or 16-mixed.")
+    parser.add_argument("--matmul-precision", default="medium", choices=["highest", "high", "medium"], help="Torch float32 matmul precision for CUDA Tensor Cores.")
     parser.add_argument("--max-samples-per-split", type=int, default=None, help="Debug limit per split.")
     parser.add_argument("--no-class-weights", action="store_true")
     parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "fixed_multiclass", "custom", "none"])
