@@ -32,6 +32,9 @@ class LIDCClassifier(pl.LightningModule):
         max_epochs=50,
         dropout=0.2,
         gradient_clip_val=0.0,
+        label_smoothing=0.0,
+        pca_feature_dim=0,
+        pca_hidden_dim=16,
         attention="none",
         fusion="none",
     ):
@@ -47,15 +50,40 @@ class LIDCClassifier(pl.LightningModule):
             attention=attention,
             fusion=fusion,
         )
+        self.pca_feature_dim = int(pca_feature_dim or 0)
+        if self.pca_feature_dim > 0:
+            hidden_dim = max(int(pca_hidden_dim or 16), num_classes * 2)
+            self.pca_head = nn.Sequential(
+                nn.Linear(num_classes + self.pca_feature_dim, hidden_dim),
+                nn.ReLU(inplace=True),
+                nn.Dropout(float(dropout)),
+                nn.Linear(hidden_dim, num_classes),
+            )
+        else:
+            self.pca_head = None
         if class_weights is not None:
             class_weights = torch.tensor(class_weights, dtype=torch.float32)
         self.register_buffer("class_weights", class_weights if class_weights is not None else torch.empty(0))
-        self.criterion = nn.CrossEntropyLoss(weight=self.class_weights if self.class_weights.numel() else None)
+        self.criterion = nn.CrossEntropyLoss(
+            weight=self.class_weights if self.class_weights.numel() else None,
+            label_smoothing=float(label_smoothing),
+        )
         self._epoch_outputs = {"train": [], "val": [], "test": []}
         self._logged_static_hparams = False
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, pca_features=None):
+        logits = self.model(x)
+        if self.pca_head is None:
+            return logits
+        if pca_features is None or pca_features.numel() == 0:
+            pca_features = torch.zeros(
+                (logits.size(0), self.pca_feature_dim),
+                dtype=logits.dtype,
+                device=logits.device,
+            )
+        else:
+            pca_features = pca_features.to(device=logits.device, dtype=logits.dtype)
+        return self.pca_head(torch.cat([logits, pca_features], dim=1))
 
     @property
     def parameter_count(self):
@@ -64,7 +92,8 @@ class LIDCClassifier(pl.LightningModule):
     def _step(self, batch, stage):
         images = batch["image"]
         labels = batch["label"]
-        logits = self(images)
+        pca_features = batch.get("pca_features")
+        logits = self(images, pca_features=pca_features)
         loss = self.criterion(logits, labels)
         probabilities = torch.softmax(logits, dim=1)
         predictions = torch.argmax(probabilities, dim=1)
@@ -99,7 +128,9 @@ class LIDCClassifier(pl.LightningModule):
         if not self._logged_static_hparams:
             self.log("hparam_dropout", float(self.hparams.dropout), on_epoch=True, prog_bar=False, batch_size=1)
             self.log("hparam_gradient_clip_val", float(self.hparams.gradient_clip_val), on_epoch=True, prog_bar=False, batch_size=1)
+            self.log("hparam_label_smoothing", float(self.hparams.label_smoothing), on_epoch=True, prog_bar=False, batch_size=1)
             self.log("hparam_learning_rate", float(self.hparams.lr), on_epoch=True, prog_bar=False, batch_size=1)
+            self.log("hparam_pca_feature_dim", float(self.hparams.pca_feature_dim), on_epoch=True, prog_bar=False, batch_size=1)
             self.log("hparam_weight_decay", float(self.hparams.weight_decay), on_epoch=True, prog_bar=False, batch_size=1)
             self._logged_static_hparams = True
 

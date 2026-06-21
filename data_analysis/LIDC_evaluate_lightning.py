@@ -65,7 +65,13 @@ def predict(model, dataloader, device):
     patient_ids = []
     for batch in dataloader:
         images = batch["image"].to(device)
-        logits = model(images)
+        pca_features = batch.get("pca_features")
+        if pca_features is not None:
+            pca_features = pca_features.to(device)
+        try:
+            logits = model(images, pca_features=pca_features)
+        except TypeError:
+            logits = model(images)
         probs = torch.softmax(logits, dim=1).detach().cpu().numpy()
         probabilities.append(probs)
         labels.extend(batch["label"].detach().cpu().numpy().astype(int).tolist())
@@ -150,6 +156,8 @@ def main(argv=None):
         image_size=image_size,
         num_workers=num_workers,
         max_samples_per_split=args.max_samples,
+        pca_features_enabled=int(config.get("pca_features", {}).get("enabled", 0)),
+        pca_n_components=int(config.get("pca_features", {}).get("requested_components", 0) or 0),
     )
     data_module.setup("test")
 

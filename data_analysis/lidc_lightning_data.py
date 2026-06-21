@@ -11,9 +11,9 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
-from lidc_lightning_utils import clean_value, import_lightning, read_csv_rows, safe_int
+from lidc_lightning_utils import clean_value, import_lightning, read_csv_rows, safe_float, safe_int
 
 
 HU_MIN = -1000.0
@@ -30,6 +30,17 @@ METADATA_COLUMNS = [
     "majority_spiculation",
     "majority_texture",
     "overall_consistency",
+    "label_confidence",
+]
+PCA_METADATA_COLUMNS = [
+    "median_max_diameter_mm",
+    "majority_calcification",
+    "majority_internal_structure",
+    "majority_sphericity",
+    "majority_margin",
+    "majority_lobulation",
+    "majority_spiculation",
+    "majority_texture",
     "label_confidence",
 ]
 
@@ -132,6 +143,40 @@ def normalise_tensor(tensor, mean=None, std=None):
 
 def metadata_from_row(row):
     return {key: clean_value(row.get(key)) for key in METADATA_COLUMNS}
+
+
+def roi_stat_feature_vector(row, volume):
+    finite = np.asarray(volume, dtype=np.float32)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        finite = np.zeros((1,), dtype=np.float32)
+
+    percentiles = np.percentile(finite, [1, 5, 10, 25, 50, 75, 90, 95, 99]).astype(np.float32)
+    features = [
+        float(finite.mean()),
+        float(finite.std()),
+        float(finite.min()),
+        float(finite.max()),
+        float((finite > 0.10).mean()),
+        float((finite > 0.25).mean()),
+        float((finite > 0.50).mean()),
+        float((finite > 0.75).mean()),
+    ]
+    features.extend(float(value) for value in percentiles)
+    for column in PCA_METADATA_COLUMNS:
+        value = safe_float(row.get(column))
+        features.append(float(value) if value is not None else 0.0)
+    return np.asarray(features, dtype=np.float32)
+
+
+def transform_pca_features(row, volume, pca_transform):
+    if not pca_transform:
+        return torch.empty(0, dtype=torch.float32)
+    vector = roi_stat_feature_vector(row, volume).reshape(1, -1)
+    scaler = pca_transform["scaler"]
+    pca = pca_transform["pca"]
+    transformed = pca.transform(scaler.transform(vector))[0].astype(np.float32)
+    return torch.from_numpy(transformed)
 
 
 def random_cutout_2d(tensor, fraction):
@@ -302,6 +347,10 @@ class LIDC2DMaxSliceDataset(Dataset):
         label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
         return Counter(safe_int(row.get(label_col)) for row in self.rows)
 
+    def labels(self):
+        label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
+        return [safe_int(row.get(label_col)) for row in self.rows]
+
     def __getitem__(self, index):
         row = self.rows[index]
         image = load_dicom_hu(row["dicom_path"])
@@ -357,6 +406,7 @@ class LIDC3DVolumeDataset(Dataset):
         augment_intensity_shift=0.05,
         augment_contrast_range=0.10,
         augment_cutout_fraction=0.0,
+        pca_transform=None,
     ):
         self.manifest_path = Path(manifest_path)
         self.split = split
@@ -372,6 +422,7 @@ class LIDC3DVolumeDataset(Dataset):
         self.augment_intensity_shift = augment_intensity_shift
         self.augment_contrast_range = augment_contrast_range
         self.augment_cutout_fraction = augment_cutout_fraction
+        self.pca_transform = pca_transform
         rows = read_csv_rows(self.manifest_path)
         if task == "binary":
             rows = [
@@ -396,6 +447,10 @@ class LIDC3DVolumeDataset(Dataset):
         label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
         return Counter(safe_int(row.get(label_col)) for row in self.rows)
 
+    def labels(self):
+        label_col = "binary_label_id" if self.task == "binary" else "multiclass_risk_label_id"
+        return [safe_int(row.get(label_col)) for row in self.rows]
+
     def __getitem__(self, index):
         row = self.rows[index]
         with np.load(row["volume_path"]) as npz:
@@ -419,6 +474,7 @@ class LIDC3DVolumeDataset(Dataset):
         return {
             "image": tensor,
             "label": torch.tensor(label, dtype=torch.long),
+            "pca_features": transform_pca_features(row, volume, self.pca_transform),
             "roi_id": row.get("roi_id", ""),
             "patient_id": row.get("PatientID") or row.get("patient_folder", ""),
             "metadata": metadata_from_row(row),
@@ -447,6 +503,9 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         augment_intensity_shift=0.05,
         augment_contrast_range=0.10,
         augment_cutout_fraction=0.0,
+        pca_features_enabled=False,
+        pca_n_components=0,
+        balanced_sampler=False,
     ):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -468,6 +527,11 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         self.augment_intensity_shift = augment_intensity_shift
         self.augment_contrast_range = augment_contrast_range
         self.augment_cutout_fraction = augment_cutout_fraction
+        self.pca_features_enabled = bool(pca_features_enabled)
+        self.pca_n_components = int(pca_n_components or 0)
+        self.balanced_sampler = bool(balanced_sampler)
+        self.pca_transform = None
+        self.pca_feature_dim = 0
         self.normalization_stats = {}
 
     def setup(self, stage=None):
@@ -521,6 +585,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             normalization_std=std,
             **kwargs
         )
+        self.fit_pca_features_if_needed()
 
     def resolve_normalization_stats(self, dataset_cls, kwargs):
         if self.normalization_mean not in (None, "", "auto") and self.normalization_std not in (None, "", "auto"):
@@ -550,10 +615,26 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         return mean, std
 
     def train_dataloader(self):
+        sampler = None
+        shuffle = True
+        if self.balanced_sampler:
+            labels = self.train_dataset.labels()
+            counts = Counter(label for label in labels if label is not None)
+            sample_weights = [
+                1.0 / float(max(counts.get(label, 0), 1))
+                for label in labels
+            ]
+            sampler = WeightedRandomSampler(
+                weights=torch.DoubleTensor(sample_weights),
+                num_samples=len(sample_weights),
+                replacement=True,
+            )
+            shuffle = False
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
-            shuffle=True,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.num_workers,
             pin_memory=torch.cuda.is_available(),
         )
@@ -582,6 +663,43 @@ class LIDCDataModule(_BASE_DATA_MODULE):
             "val": dict(self.val_dataset.label_counts()),
             "test": dict(self.test_dataset.label_counts()),
         }
+
+    def fit_pca_features_if_needed(self):
+        if self.input_dim != "3d" or not self.pca_features_enabled or self.pca_n_components <= 0:
+            return
+        try:
+            from sklearn.decomposition import PCA
+            from sklearn.preprocessing import StandardScaler
+        except Exception as exc:
+            raise ImportError("scikit-learn is required for PCA feature fusion.") from exc
+
+        rows = getattr(self.train_dataset, "rows", [])
+        if not rows:
+            return
+        vectors = []
+        for row in rows:
+            with np.load(row["volume_path"]) as npz:
+                volume = npz["volume"].astype(np.float32)
+            vectors.append(roi_stat_feature_vector(row, volume))
+        matrix = np.stack(vectors, axis=0)
+        scaler = StandardScaler()
+        scaled = scaler.fit_transform(matrix)
+        n_components = min(int(self.pca_n_components), scaled.shape[0], scaled.shape[1])
+        if n_components <= 0:
+            return
+        pca = PCA(n_components=n_components, random_state=42)
+        pca.fit(scaled)
+        self.pca_transform = {
+            "scaler": scaler,
+            "pca": pca,
+            "n_components": n_components,
+            "source": "train_roi_statistics",
+            "explained_variance_ratio": [float(value) for value in pca.explained_variance_ratio_],
+        }
+        self.pca_feature_dim = n_components
+        for dataset in (self.train_dataset, self.val_dataset, self.test_dataset):
+            if hasattr(dataset, "pca_transform"):
+                dataset.pca_transform = self.pca_transform
 
 
 def compute_dataset_mean_std(dataset):

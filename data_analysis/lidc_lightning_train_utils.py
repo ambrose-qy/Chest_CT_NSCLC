@@ -25,7 +25,7 @@ from lidc_lightning_utils import (
 from lidc_lightning_models import count_parameters
 
 
-FIXED_MULTICLASS_CLASS_WEIGHTS = [1.5, 0.5, 1.8]
+FIXED_MULTICLASS_CLASS_WEIGHTS = [1.20, 0.90, 1.30]
 CHECKPOINT_MONITORS = {
     "auc_roc": "val_auc_roc",
     "f1": "val_f1",
@@ -196,7 +196,7 @@ def make_metric_guard_callback(pl, args):
                 self.bad_counts[reason] = self.bad_counts.get(reason, 0) + 1
                 if self.bad_counts[reason] >= self.patience:
                     self.stop_reason = "{} for {} validation epochs".format(reason, self.bad_counts[reason])
-                    log("Metric guard stopping training: {}".format(self.stop_reason))
+                    log("Metric guard stopping training: {}. Metrics: {}".format(self.stop_reason, metrics))
                     trainer.should_stop = True
                     break
 
@@ -348,6 +348,9 @@ def run_lightning_training(args, input_dim, manifest_path):
         augment_intensity_shift=getattr(args, "augment_intensity_shift", 0.05),
         augment_contrast_range=getattr(args, "augment_contrast_range", 0.10),
         augment_cutout_fraction=getattr(args, "augment_cutout_fraction", 0.0),
+        pca_features_enabled=getattr(args, "pca_features_enabled", 0),
+        pca_n_components=getattr(args, "pca_n_components", 0),
+        balanced_sampler=getattr(args, "balanced_sampler", 0),
     )
     data_module.setup()
     counts = data_module.class_counts()
@@ -361,6 +364,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         lr=args.lr,
         weight_decay=args.weight_decay,
         class_weights=weights,
+        label_smoothing=getattr(args, "label_smoothing", 0.0),
         pretrained=getattr(args, "pretrained", False),
         in_channels=getattr(args, "in_channels", None),
         scheduler=args.scheduler,
@@ -369,6 +373,8 @@ def run_lightning_training(args, input_dim, manifest_path):
         gradient_clip_val=getattr(args, "gradient_clip_val", 0.0),
         attention=getattr(args, "attention", "none"),
         fusion=getattr(args, "fusion", "none"),
+        pca_feature_dim=getattr(data_module, "pca_feature_dim", 0),
+        pca_hidden_dim=getattr(args, "pca_hidden_dim", 16),
     )
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -432,6 +438,8 @@ def run_lightning_training(args, input_dim, manifest_path):
         "class_counts": counts,
         "class_weights": weights,
         "class_weight_mode": getattr(args, "class_weight_mode", "balanced"),
+        "balanced_sampler": bool(getattr(args, "balanced_sampler", 0)),
+        "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
         "task": args.task,
         "split_column": "binary_split" if args.task == "binary" else "multiclass_split",
         "label_column": "binary_label_id" if args.task == "binary" else "multiclass_risk_label_id",
@@ -453,7 +461,15 @@ def run_lightning_training(args, input_dim, manifest_path):
         "dropout": getattr(args, "dropout", 0.2),
         "attention": getattr(args, "attention", "none"),
         "fusion": getattr(args, "fusion", "none"),
-        "parameter_count": count_parameters(model.model),
+        "pca_features": {
+            "enabled": bool(getattr(args, "pca_features_enabled", 0)),
+            "requested_components": int(getattr(args, "pca_n_components", 0) or 0),
+            "feature_dim": int(getattr(data_module, "pca_feature_dim", 0)),
+            "hidden_dim": int(getattr(args, "pca_hidden_dim", 16) or 16),
+            "source": data_module.pca_transform.get("source", "") if getattr(data_module, "pca_transform", None) else "",
+            "explained_variance_ratio": data_module.pca_transform.get("explained_variance_ratio", []) if getattr(data_module, "pca_transform", None) else [],
+        },
+        "parameter_count": count_parameters(model),
         "matmul_precision": matmul_precision,
         "monitor_metric": monitor_metric,
         "checkpoint_monitors": CHECKPOINT_MONITORS,
@@ -596,6 +612,8 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--no-class-weights", action="store_true")
     parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "fixed_multiclass", "custom", "none"])
     parser.add_argument("--custom-class-weights", default=None, help="Comma-separated class weights, e.g. 1.0,1.5.")
+    parser.add_argument("--balanced-sampler", type=int, default=0, help="Use inverse-frequency weighted sampling for the training split.")
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="CrossEntropy label smoothing. Helpful for unstable multiclass runs.")
     parser.add_argument("--normalization-mean", default="auto", help="auto or scalar/list mean for normalized HU values.")
     parser.add_argument("--normalization-std", default="auto", help="auto or scalar/list std for normalized HU values.")
     parser.add_argument("--normalization-stats-samples", type=int, default=128)
@@ -608,6 +626,9 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--augment-contrast-range", type=float, default=0.10)
     parser.add_argument("--augment-cutout-fraction", type=float, default=0.0)
     parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--pca-features-enabled", type=int, default=0, help="Fuse train-fitted PCA ROI statistic features with CNN logits.")
+    parser.add_argument("--pca-n-components", type=int, default=0, help="Number of PCA ROI statistic components to use when enabled.")
+    parser.add_argument("--pca-hidden-dim", type=int, default=16, help="Hidden size for the PCA/logit fusion head.")
     parser.add_argument("--attention", default="none", choices=["none", "se", "cbam"], help="Attention module. CBAM is recommended for 3D medical imaging.")
     parser.add_argument("--fusion", default="none", choices=["none", "multiscale", "multiview"], help="3D feature fusion mode.")
     parser.add_argument("--gradient-clip-val", type=float, default=0.0)

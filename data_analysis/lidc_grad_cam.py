@@ -55,9 +55,12 @@ class CamExtractor(object):
     def _store_gradient(self, gradient):
         self.gradients = gradient
 
-    def compute(self, image, class_id):
+    def compute(self, image, class_id, pca_features=None):
         self.model.zero_grad(set_to_none=True)
-        logits = self.model(image)
+        try:
+            logits = self.model(image, pca_features=pca_features)
+        except TypeError:
+            logits = self.model(image)
         score = logits[:, int(class_id)].sum()
         score.backward()
         if self.activations is None or self.gradients is None:
@@ -201,8 +204,14 @@ def collect_grad_cam_samples(model, data_module, class_names, max_samples, devic
     with torch.no_grad():
         for batch in data_module.test_dataloader():
             images = batch["image"].to(device)
+            pca_features = batch.get("pca_features")
+            if pca_features is not None:
+                pca_features = pca_features.to(device)
             labels = batch["label"]
-            logits = model(images)
+            try:
+                logits = model(images, pca_features=pca_features)
+            except TypeError:
+                logits = model(images)
             probabilities = torch.softmax(logits, dim=1).detach().cpu()
             predictions = probabilities.argmax(dim=1)
             for item_idx in range(images.size(0)):
@@ -213,6 +222,7 @@ def collect_grad_cam_samples(model, data_module, class_names, max_samples, devic
                     "true_label": true_label,
                     "predicted_label": predicted_label,
                     "probabilities": probabilities[item_idx].numpy(),
+                    "pca_features": pca_features[item_idx:item_idx + 1].detach().cpu() if pca_features is not None else None,
                     "roi_id": batch["roi_id"][item_idx],
                     "patient_id": batch["patient_id"][item_idx],
                     "metadata": batch_metadata(batch, item_idx),
@@ -283,10 +293,13 @@ def generate_grad_cam_visualizations(
             roi_id = sample["roi_id"]
             patient_id = sample["patient_id"]
             metadata = sample.get("metadata", {})
+            pca_features = sample.get("pca_features")
+            if pca_features is not None:
+                pca_features = pca_features.to(device)
 
             with torch.enable_grad():
                 target_class = predicted_label
-                logits, activations, gradients = extractor.compute(image, target_class)
+                logits, activations, gradients = extractor.compute(image, target_class, pca_features=pca_features)
                 probabilities = torch.softmax(logits, dim=1).detach().cpu().numpy()[0]
                 cams = {
                     "grad_cam": resize_cam(grad_cam_from_tensors(activations, gradients), image),
