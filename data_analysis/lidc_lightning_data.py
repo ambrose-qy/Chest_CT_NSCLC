@@ -506,6 +506,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         pca_features_enabled=False,
         pca_n_components=0,
         balanced_sampler=False,
+        balanced_sampler_power=1.0,
     ):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -530,6 +531,7 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         self.pca_features_enabled = bool(pca_features_enabled)
         self.pca_n_components = int(pca_n_components or 0)
         self.balanced_sampler = bool(balanced_sampler)
+        self.balanced_sampler_power = float(balanced_sampler_power)
         self.pca_transform = None
         self.pca_feature_dim = 0
         self.normalization_stats = {}
@@ -620,8 +622,9 @@ class LIDCDataModule(_BASE_DATA_MODULE):
         if self.balanced_sampler:
             labels = self.train_dataset.labels()
             counts = Counter(label for label in labels if label is not None)
+            power = max(float(self.balanced_sampler_power), 0.0)
             sample_weights = [
-                1.0 / float(max(counts.get(label, 0), 1))
+                1.0 / (float(max(counts.get(label, 0), 1)) ** power)
                 for label in labels
             ]
             sampler = WeightedRandomSampler(

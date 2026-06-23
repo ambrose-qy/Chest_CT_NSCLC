@@ -351,6 +351,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         pca_features_enabled=getattr(args, "pca_features_enabled", 0),
         pca_n_components=getattr(args, "pca_n_components", 0),
         balanced_sampler=getattr(args, "balanced_sampler", 0),
+        balanced_sampler_power=getattr(args, "balanced_sampler_power", 1.0),
     )
     data_module.setup()
     counts = data_module.class_counts()
@@ -439,6 +440,7 @@ def run_lightning_training(args, input_dim, manifest_path):
         "class_weights": weights,
         "class_weight_mode": getattr(args, "class_weight_mode", "balanced"),
         "balanced_sampler": bool(getattr(args, "balanced_sampler", 0)),
+        "balanced_sampler_power": float(getattr(args, "balanced_sampler_power", 1.0)),
         "label_smoothing": float(getattr(args, "label_smoothing", 0.0)),
         "task": args.task,
         "split_column": "binary_split" if args.task == "binary" else "multiclass_split",
@@ -613,6 +615,7 @@ def add_common_training_args(parser, default_output_dir=None):
     parser.add_argument("--class-weight-mode", default="balanced", choices=["balanced", "sqrt_balanced", "fixed_multiclass", "custom", "none"])
     parser.add_argument("--custom-class-weights", default=None, help="Comma-separated class weights, e.g. 1.0,1.5.")
     parser.add_argument("--balanced-sampler", type=int, default=0, help="Use inverse-frequency weighted sampling for the training split.")
+    parser.add_argument("--balanced-sampler-power", type=float, default=1.0, help="Strength of weighted sampling. 1.0 fully balances classes; 0.5 is gentler.")
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="CrossEntropy label smoothing. Helpful for unstable multiclass runs.")
     parser.add_argument("--normalization-mean", default="auto", help="auto or scalar/list mean for normalized HU values.")
     parser.add_argument("--normalization-std", default="auto", help="auto or scalar/list std for normalized HU values.")
