@@ -3,9 +3,10 @@ Run the stage-4 post-hoc code pipeline after model training is complete.
 
 Default steps:
 1. Backfill model predictions and ROC curves.
-2. Run clinical threshold analysis.
-3. Run ensemble prediction analysis.
-4. Rebuild 3D ROI QC table from existing NPZ volumes.
+2. Consolidate Grad-CAM failure modes and calcification evidence.
+3. Run clinical threshold analysis.
+4. Run ensemble prediction analysis.
+5. Rebuild 3D ROI QC table from existing NPZ volumes.
 
 Optional:
     --run-luna 1
@@ -39,6 +40,7 @@ def parse_args(argv=None):
     parser = argparse.ArgumentParser(description="Run stage-4 LIDC post-hoc deliverable scripts.")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--skip-backfill", type=int, default=0)
+    parser.add_argument("--skip-failure-analysis", type=int, default=0)
     parser.add_argument("--skip-clinical", type=int, default=0)
     parser.add_argument("--skip-ensemble", type=int, default=0)
     parser.add_argument("--skip-roi-qc", type=int, default=0)
@@ -62,6 +64,13 @@ def main(argv=None):
         if args.force_backfill:
             cmd.append("--force")
         run_step("Backfill predictions and ROC", cmd, args.dry_run)
+
+    if not args.skip_failure_analysis:
+        run_step(
+            "Grad-CAM failure mode analysis",
+            [python, str(SCRIPT_DIR / "LIDC_failure_mode_analysis.py")],
+            args.dry_run,
+        )
 
     if not args.skip_clinical:
         run_step("Clinical value analysis", [python, str(SCRIPT_DIR / "LIDC_clinical_value_analysis.py")], args.dry_run)

@@ -1,0 +1,51 @@
+selection_date: "2026-06-24"
+selection_rule: "Latest complete CBAM run for each architecture and task."
+runs:
+  - input_dim: 2d
+    model: resnet18
+    task: binary
+    run_dir: data/processed/model_results/lidc_lightning/2d/resnet/2d_resnet18_binary_seed42
+    checkpoint_source: existing_selected_checkpoint
+
+  - input_dim: 2d
+    model: resnet18
+    task: multiclass
+    run_dir: data/processed/model_results/lidc_lightning/2d/resnet/2d_resnet18_multiclass_seed42_20260615_165304
+    checkpoint_source: existing_selected_checkpoint
+
+  - input_dim: 2d
+    model: densenet121
+    task: binary
+    run_dir: data/processed/model_results/lidc_lightning/2d/densenet/2d_densenet121_binary_seed42_20260624_123530
+    checkpoint: checkpoints/best_auc_roc-epoch=001-val_auc_roc=0.8985.ckpt
+    checkpoint_source: best_validation_auc
+
+  - input_dim: 2d
+    model: densenet121
+    task: multiclass
+    run_dir: data/processed/model_results/lidc_lightning/2d/densenet/2d_densenet121_multiclass_seed42_20260617_100805
+    checkpoint_source: primary_best_f1
+
+  - input_dim: 3d
+    model: resnet3d
+    task: binary
+    run_dir: data/processed/model_results/lidc_lightning/3d/resnet/3d_resnet3d_binary_seed42_20260617_154252
+    checkpoint_source: primary_best_f1
+
+  - input_dim: 3d
+    model: resnet3d
+    task: multiclass
+    run_dir: data/processed/model_results/lidc_lightning/3d/resnet/3d_resnet3d_multiclass_seed42_20260623_010832
+    checkpoint_source: primary_best_f1
+
+  - input_dim: 3d
+    model: vnet
+    task: binary
+    run_dir: data/processed/model_results/lidc_lightning/3d/vnet/3d_vnet_binary_seed42_20260618_095134
+    checkpoint_source: primary_best_f1
+
+  - input_dim: 3d
+    model: vnet
+    task: multiclass
+    run_dir: data/processed/model_results/lidc_lightning/3d/vnet/3d_vnet_multiclass_seed42_20260622_162102
+    checkpoint_source: primary_best_f1

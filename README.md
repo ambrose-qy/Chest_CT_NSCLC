@@ -219,17 +219,32 @@ C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_3d_resnet.py 
 C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_3d_vnet.py --epochs 60 --batch-size 4
 ```
 
-For ordinary tuning, edit the `HYPERPARAMETERS` dictionary near the top of each model-named file and run the file directly without command-line overrides. The same dictionary controls the task, normalization, augmentation, class weighting, dropout, and gradient clipping. The training functions can also be imported from another script, for example `from LIDC_3d_resnet import train_3d_resnet`.
+For ordinary tuning, edit `configs/lidc_training.yaml` and run the model-named file directly without command-line overrides. The standalone configuration controls the task, normalization, augmentation, class weighting, attention, fusion, dropout, and gradient clipping for all four model profiles. The training functions can still be imported from another script, for example `from LIDC_3d_resnet import train_3d_resnet`, and dictionary overrides remain supported for programmatic experiments.
 
-The default normalization mode is `normalization_mean = "auto"` and `normalization_std = "auto"`, which computes mean/std from the training split and applies the same statistics to train/validation/test data. Current augmentations include rotation, flipping, scaling, Gaussian noise, intensity shift, contrast jitter, and cutout. Class weighting defaults to `class_weight_mode = "balanced"`; use `class_weight_mode = "custom"` with `custom_class_weights = "w0,w1"` or `"w0,w1,w2"` for manual binary or multiclass weights.
+The default normalization mode is `normalization_mean = "auto"` and `normalization_std = "auto"`, which computes mean/std from the training split and applies the same statistics to train/validation/test data. Current augmentations include rotation, flipping, scaling, Gaussian noise, intensity shift, contrast jitter, and cutout. Class weighting is configured per model profile; use `class_weight_mode = "custom"` with `custom_class_weights = "w0,w1"` or `"w0,w1,w2"` for manual binary or multiclass weights.
 
 Attention and fusion experiments are available through the shared model factory. Use `--attention cbam` for the recommended CBAM module, or `--attention se` for an SE comparison. For 3D models, `--fusion multiscale` enables multiscale feature fusion in ResNet3D and `--fusion multiview` enables axial/coronal/sagittal multi-view fusion. The model-named defaults now use CBAM, with 3D ResNet defaulting to multiscale fusion.
+
+Audit the selected report checkpoints at configuration and state-dictionary level:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_verify_cbam_results.py
+```
+
+The command returns a non-zero exit status if any selected checkpoint is not
+CBAM-compliant. Use `--allow-incomplete` only when producing an interim audit.
 
 Each run prints and records the active task and split source, for example `Task: binary using split column 'binary_split'`. For 2D and 3D training, set `task` to `binary` or `multiclass`; the saved `config.json` records `task`, `split_column`, and `label_column`. The 2D maximum-slice workflow writes task-specific binary and multiclass manifests.
 
 Each run writes checkpoints, `config.json`, `hparams.json`, `best_config.json`, `test_metrics.json`, `test_confusion_matrix.csv`, `test_confusion_matrix.json`, `test_confusion_matrix.png`, and Lightning CSV logs under `data/processed/model_results/lidc_lightning/<2d-or-3d>/<model-family>/<run-name>/`. The CSV logs include learning rate, loss, accuracy, precision, recall, F1, AUC-ROC, label counts, dropout and clipping hyperparameters, average absolute gradient, gradient L2 norm, maximum absolute gradient, and parameter L2 norm.
 
 Grad-CAM and Grad-CAM++ outputs are written after training when `enable_grad_cam` is enabled. The visualisation step prioritises incorrectly predicted test cases, writes overlays, records attention peak/bounding-box locations, and summarises failure patterns such as small nodules, calcification-marked false positives, low reader consistency, and false negative/false positive class transitions.
+
+Consolidate the selected model error cases and restore calcification metadata directly from the reader-level ROI annotations without retraining:
+
+```powershell
+conda run -n torch-gpu python data_analysis\LIDC_failure_mode_analysis.py
+```
 
 On Windows, if `conda run` fails while printing Lightning progress output because of console encoding, run the environment Python directly instead:
 

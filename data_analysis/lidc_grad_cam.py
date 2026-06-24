@@ -14,6 +14,16 @@ import torch.nn.functional as F
 from lidc_lightning_utils import write_csv
 
 
+CALCIFICATION_LABELS = {
+    1: "popcorn",
+    2: "laminated",
+    3: "solid",
+    4: "non_central",
+    5: "central",
+    6: "absent",
+}
+
+
 def safe_name(value):
     text = str(value or "sample")
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", text)[:140]
@@ -177,8 +187,18 @@ def failure_patterns(true_label, predicted_label, class_names, metadata):
         patterns.append("small_nodule_lt_6mm")
 
     calcification = str(metadata.get("majority_calcification", "")).strip()
-    if calcification:
-        patterns.append("calcification_score_{}".format(calcification))
+    try:
+        calcification_code = int(float(calcification))
+    except Exception:
+        calcification_code = None
+    calcification_present = calcification_code in (1, 2, 3, 4, 5)
+    if calcification_code in CALCIFICATION_LABELS:
+        patterns.append(
+            "calcification_{}_code_{}".format(
+                CALCIFICATION_LABELS[calcification_code],
+                calcification_code,
+            )
+        )
 
     texture = str(metadata.get("majority_texture", "")).strip()
     if texture:
@@ -188,7 +208,7 @@ def failure_patterns(true_label, predicted_label, class_names, metadata):
     pred_name = class_names[predicted_label] if predicted_label < len(class_names) else str(predicted_label)
     if true_name in ("benign", "low_risk") and pred_name in ("malignant", "high_risk"):
         patterns.append("false_positive_as_malignant_or_high_risk")
-        if calcification:
+        if calcification_present:
             patterns.append("calcified_nodule_flagged_as_malignant_pattern")
     if true_name in ("malignant", "high_risk") and pred_name in ("benign", "low_risk"):
         patterns.append("false_negative_as_benign_or_low_risk")
