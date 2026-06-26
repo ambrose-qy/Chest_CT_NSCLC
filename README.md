@@ -1,6 +1,6 @@
 # Chest_CT_NSCLC
 
-Exploratory and preprocessing workspace for chest CT datasets used in lung cancer and pulmonary nodule research. The current project version includes LIDC-IDRI DICOM/XML analysis and LUNA16 subset0-4 preprocessing.
+End-to-end chest CT workspace for pulmonary nodule preprocessing, 2D/3D classification, LUNA16-domain generalisation, explainability, and complete-CT automatic nodule detection.
 
 ## Repository Layout
 
@@ -64,6 +64,15 @@ Chest_CT_NSCLC/
 - `data_analysis/LIDC_evaluate_lightning.py` evaluates a Lightning checkpoint on the independent test set and writes metrics, predictions, confusion matrix, and ROC data.
 - `data_analysis/LIDC_tune_lightning.py` writes or executes hyperparameter tuning plans and records the best configuration.
 - `data_analysis/LIDC_compare_lightning_experiments.py` aggregates completed Lightning runs into a model-comparison report.
+- `data_analysis/LUNA_build_labeled_external_rois.py` matches LUNA16 annotations to LIDC lesion labels and exports label-preserving 64 x 64 x 64 ROIs directly from raw MHD scans.
+- `data_analysis/LIDC_evaluate_luna_generalization.py` evaluates all selected 2D and 3D models on the LUNA16-domain labeled ROIs.
+- `data_analysis/LUNA_prepare_candidate_dataset.py` builds a balanced 32 x 32 x 32 LUNA16 candidate dataset for nodule/non-nodule false-positive reduction.
+- `data_analysis/LUNA_train_candidate_detector.py` trains the lightweight 3D CBAM candidate detector and exports its checkpoint, metrics, confusion matrix, and training curve.
+- `data_analysis/LUNA_evaluate_candidate_detector.py` reproduces held-out candidate-detector metrics and exports per-candidate probabilities, confusion matrix, and ROC curve.
+- `data_analysis/LIDC_full_ct_detection.py` runs complete-CT lung segmentation, high-recall proposal generation, CBAM false-positive reduction, malignancy classification, and risk stratification.
+- `data_analysis/LUNA_evaluate_full_ct_proposals.py` evaluates complete-CT proposal sensitivity and post-CBAM detection sensitivity/false positives per scan on held-out LUNA16 subsets.
+- `data_analysis/LUNA_analyze_full_ct_detection.py` identifies annotation-level proposal and candidate-filter misses and summarises sensitivity by nodule diameter.
+- `data_analysis/LUNA_build_completion_report.py` consolidates external generalisation, candidate-detector, and complete-CT results into a Chinese Markdown report.
 - `data_analysis/LUNA_process.py` preprocesses LUNA16 subset0-4 from `E:\LUNA`, including de-identification, 1 mm resampling, HU normalisation, lung parenchyma segmentation, and coordinate validation.
 - `data_analysis/LUNA_process2.py` preprocesses LUNA16 subset5-9 from `D:\LUNA` with the same pipeline and project-local output naming.
 - `data_analysis/LIDC_analysis.ipynb` and `data_analysis/LUNA16_data_analysis.ipynb` are notebook references used during workflow development.
@@ -278,11 +287,76 @@ conda run -n torch-gpu python data_analysis\LIDC_ablation_lightning.py --input-d
 conda run -n torch-gpu python data_analysis\LIDC_ablation_lightning.py --input-dim 3d --model resnet3d --task multiclass --execute
 ```
 
-Export LUNA16 nodule-centred ROI cubes and run all completed LIDC models on the external LUNA distribution. LUNA16 does not provide LIDC malignancy labels, so these reports measure external-domain prediction behaviour, confidence, entropy, and diameter-stratified prediction distributions rather than supervised accuracy/F1:
+Build label-matched LUNA16-domain ROIs and evaluate every selected model:
 
 ```powershell
-conda run -n torch-gpu python data_analysis\LUNA_export_lidc_external_rois.py
-conda run -n torch-gpu python data_analysis\LIDC_validate_luna_external.py --all-runs
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_build_labeled_external_rois.py
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_evaluate_luna_generalization.py
+```
+
+LUNA16 is derived from LIDC-IDRI, so this is a cross-preprocessing and cross-data-distribution generalisation test, not an independent-hospital validation. The exporter performs one-to-one physical-coordinate matching and retains the original patient-level LIDC test assignment before computing accuracy, precision, recall, F1, AUC-ROC, confusion matrices, and ROC curves.
+
+Current generated outputs are written to:
+
+```text
+data/processed/luna16_labeled_external_rois/
+data/processed/model_reports/lidc_luna16_generalization/
+```
+
+## Complete CT Nodule Detection
+
+Build the LUNA16 candidate patch dataset and train the 3D CBAM false-positive reduction model:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_prepare_candidate_dataset.py
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_train_candidate_detector.py
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_evaluate_candidate_detector.py
+```
+
+The candidate model uses `subset0-7` for training, `subset8` for validation, and `subset9` for independent testing. Its inputs are 32 x 32 x 32 HU-normalised patches. CBAM is applied to the deepest 3D feature map to preserve channel and spatial attention without the excessive cost of high-resolution 3D spatial attention.
+
+Edit `configs/luna16_detection.yaml` to maintain candidate-training hyperparameters, proposal settings, detection thresholds, selected checkpoints, and LUNA16 evaluation operating points without changing Python source code.
+
+Run automatic detection and risk classification on a DICOM series directory or a supported volume file:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LIDC_full_ct_detection.py `
+  --input D:\path\to\dicom_series `
+  --output-dir data\processed\model_reports\full_ct_detection_case
+```
+
+The pipeline performs:
+
+1. DICOM/MHD/NIfTI loading and 1 mm isotropic resampling.
+2. Robust lung parenchyma segmentation.
+3. Multi-scale 3D LoG, axial connected-component, and 1 mm small-nodule local-maximum proposal generation.
+4. LUNA16-trained 3D CBAM candidate scoring and false-positive reduction.
+5. 3D ResNet binary malignancy prediction and three-class risk stratification.
+6. CSV, metadata JSON, ROI NPZ, and annotated overview export.
+
+Evaluate the complete-CT detector on all held-out `subset9` scans:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_evaluate_full_ct_proposals.py `
+  --subsets subset9 `
+  --output-dir data\processed\model_reports\luna16_full_ct_detection_subset9
+```
+
+The report separates proposal sensitivity from final detection sensitivity and writes multiple nodule-probability operating points with sensitivity, detections per scan, and false positives per scan. The default `0.85` threshold was selected from the complete `subset9` evaluation as a practical sensitivity/false-positive operating point; it remains configurable for sensitivity-first or specificity-first use.
+
+Current held-out `subset9` results: candidate-classifier AUC `0.9870` and F1 `0.8992`; complete-CT proposal sensitivity `0.8095`; final detection sensitivity `0.6667` with `7.60` false positives per scan at threshold `0.85`. The 3-6 mm proposal sensitivity is `0.8222`.
+
+After evaluation, generate annotation-level failure analysis and the consolidated report:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_analyze_full_ct_detection.py
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe data_analysis\LUNA_build_completion_report.py
+```
+
+Launch the interactive ROI/complete-CT interface:
+
+```powershell
+C:\Users\Ambro\.conda\envs\torch-gpu\python.exe -m streamlit run data_analysis\LIDC_streamlit_app.py
 ```
 
 ## LUNA16 Workflow
@@ -351,4 +425,4 @@ The subset5-9 script writes the same table names with the `luna_s5_9_` prefix.
 
 - `data/raw/.gitkeep` and `data/processed/.gitkeep` preserve the empty folder structure in git.
 - `.gitignore` excludes raw data, processed outputs, archives, medical image formats, common model files, Python caches, and notebook checkpoints.
-- If the analysis environment stabilizes, add a `requirements.txt` or environment file at the repository root.
+- `requirements.txt` and `environment.yml` record the verified `torch-gpu` dependency versions used by the current pipeline.

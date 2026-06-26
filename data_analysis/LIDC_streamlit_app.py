@@ -9,7 +9,9 @@ Run:
 
 from __future__ import print_function
 
+import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pandas as pd
@@ -17,7 +19,15 @@ import torch
 
 import streamlit as st
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 from LIDC_inference import load_model, predict_cases, read_json
+from LIDC_full_ct_detection import (
+    parse_args as parse_full_ct_args,
+    run_full_ct_detection,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -45,9 +55,129 @@ def save_upload(uploaded):
     return Path(handle.name)
 
 
+def safe_extract_zip(uploaded, destination):
+    archive_path = Path(destination) / uploaded.name
+    archive_path.write_bytes(uploaded.getbuffer())
+    root = Path(destination).resolve()
+    with zipfile.ZipFile(str(archive_path), "r") as archive:
+        for member in archive.infolist():
+            target = (root / member.filename).resolve()
+            if target != root and root not in target.parents:
+                raise ValueError("Unsafe path in uploaded ZIP archive.")
+        archive.extractall(str(root))
+
+
+def find_complete_ct_input(root):
+    root = Path(root)
+    supported = {".mhd", ".mha", ".nii", ".nrrd"}
+    volume_files = [
+        path
+        for path in root.rglob("*")
+        if path.is_file()
+        and (
+            path.suffix.lower() in supported
+            or path.name.lower().endswith(".nii.gz")
+        )
+    ]
+    if volume_files:
+        return sorted(volume_files)[0]
+    directories = {}
+    for path in root.rglob("*"):
+        if not path.is_file() or path.suffix.lower() in {".raw", ".zip"}:
+            continue
+        directories[path.parent] = directories.get(path.parent, 0) + 1
+    if not directories:
+        raise ValueError("No CT volume or DICOM series found in the upload.")
+    return max(directories, key=directories.get)
+
+
+def full_ct_interface():
+    uploaded = st.file_uploader(
+        "Upload a complete CT ZIP or volume",
+        type=["zip", "mha", "nii", "gz", "nrrd"],
+    )
+    threshold = st.sidebar.slider(
+        "Nodule probability threshold",
+        min_value=0.5,
+        max_value=0.99,
+        value=0.85,
+        step=0.01,
+    )
+    max_detections = st.sidebar.number_input(
+        "Maximum detections",
+        min_value=1,
+        max_value=256,
+        value=64,
+        step=1,
+    )
+    save_rois = st.sidebar.checkbox("Export candidate ROIs", value=False)
+    if not st.button("Run complete CT detection"):
+        return
+    if uploaded is None:
+        st.warning("Upload a complete CT first.")
+        return
+
+    with tempfile.TemporaryDirectory(prefix="lidc_full_ct_") as temp_dir:
+        temp_root = Path(temp_dir)
+        if Path(uploaded.name).suffix.lower() == ".zip":
+            safe_extract_zip(uploaded, temp_root)
+            input_path = find_complete_ct_input(temp_root)
+        else:
+            input_path = temp_root / uploaded.name
+            input_path.write_bytes(uploaded.getbuffer())
+        output_dir = temp_root / "output"
+        argv = [
+            "--input",
+            str(input_path),
+            "--output-dir",
+            str(output_dir),
+            "--nodule-threshold",
+            str(threshold),
+            "--max-detections",
+            str(int(max_detections)),
+        ]
+        if save_rois:
+            argv.append("--save-rois")
+        args = parse_full_ct_args(argv)
+        status = st.status("Running complete CT detection", expanded=True)
+        try:
+            result = run_full_ct_detection(args, progress_callback=status.write)
+        except Exception as exc:
+            status.update(label="Complete CT detection failed", state="error")
+            st.exception(exc)
+            return
+        status.update(label="Complete CT detection finished", state="complete")
+
+        dataframe = pd.DataFrame(result["rows"])
+        st.subheader("Detected Nodules")
+        st.dataframe(dataframe, use_container_width=True)
+        if Path(result["overview_png"]).exists():
+            st.image(str(result["overview_png"]), use_container_width=True)
+        st.download_button(
+            "Download candidate CSV",
+            Path(result["candidate_csv"]).read_bytes(),
+            file_name="full_ct_nodule_candidates.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download metadata JSON",
+            Path(result["metadata_json"]).read_bytes(),
+            file_name="full_ct_detection_metadata.json",
+            mime="application/json",
+        )
+        st.metric("Retained candidates", result["candidate_count"])
+
+
 def main():
     st.set_page_config(page_title="LIDC Lung Nodule Risk Prototype", layout="wide")
     st.title("LIDC Lung Nodule Risk Prototype")
+    mode = st.sidebar.radio(
+        "Inference mode",
+        ["Complete CT detection", "ROI classification"],
+    )
+    if mode == "Complete CT detection":
+        full_ct_interface()
+        return
 
     run_configs = find_run_dirs()
     run_labels = [str(path.parent.relative_to(PROJECT_ROOT)) for path in run_configs]

@@ -38,3 +38,6 @@ runs/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# Local document rendering and scratch files
+tmp/
